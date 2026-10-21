@@ -102,16 +102,28 @@ static void WCPLClearBG(id view) {
     if (WCPLBool(@"WCPLHomeCorner")) ((UIView *)view).backgroundColor = UIColor.clearColor;
 }
 %hook MFWebMMBtn
-- (void)layoutSubviews { %orig; WCPLClearBG(self); }
+- (void)layoutSubviews {
+    %orig;
+    WCPLClearBG(self);
+}
 %end
 %hook MMFavCellComponent
-- (void)layoutSubviews { %orig; WCPLClearBG(self); }
+- (void)layoutSubviews {
+    %orig;
+    WCPLClearBG(self);
+}
 %end
 %hook MMFavImageComponent
-- (void)layoutSubviews { %orig; WCPLClearBG(self); }
+- (void)layoutSubviews {
+    %orig;
+    WCPLClearBG(self);
+}
 %end
 %hook MFBannerBtn
-- (void)layoutSubviews { %orig; WCPLClearBG(self); }
+- (void)layoutSubviews {
+    %orig;
+    WCPLClearBG(self);
+}
 %end
 
 #pragma mark - 4. 消息直达 (WCPush2Chat 0x4bbc / 0x4e28 / 0x5530 / 0x5974)
