@@ -400,7 +400,10 @@ static void WCPLPrioritize(UIView *view, UIGestureRecognizer *ours) {
 // WeChat's own full-screen long press (menu) must not fire inside the 15% edge zones.
 %hook WXFullScreenGestureRecognizer
 - (void)LongPressEvents {
-    if (!WCPLBool(@"WCPLVideoSpeed")) { %orig; return; }
+    if (!WCPLBool(@"WCPLVideoSpeed")) {
+        %orig;
+        return;
+    }
     UIView *v = ((UIGestureRecognizer *)self).view;
     if (v && WCPLIsEdge([self touchBeginPoint].x, v.bounds.size.width)) return;
     %orig;
