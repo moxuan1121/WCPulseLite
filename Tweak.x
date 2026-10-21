@@ -53,7 +53,8 @@ static CFTimeInterval gTopKeepDeadline;
 %end
 
 %hook CGroupMgr
-- (void)removeChatRoomTopMsgLocalWithUserName:(id)userName topId:(id)topId {
+// topId is an integer (original only storeStrong's userName); typing it `id` made ARC retain 0x1a5 -> crash.
+- (void)removeChatRoomTopMsgLocalWithUserName:(id)userName topId:(unsigned long long)topId {
     if (WCPLBool(@"WCPLTopClickKeep") && CACurrentMediaTime() < gTopKeepDeadline) return;
     %orig;
 }
