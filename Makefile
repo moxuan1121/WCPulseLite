@@ -8,7 +8,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = WCPulseLite
 
 WCPulseLite_FILES = Tweak.x
-WCPulseLite_CFLAGS = -fobjc-arc
-WCPulseLite_FRAMEWORKS = UIKit Foundation QuartzCore
+WCPulseLite_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+WCPulseLite_FRAMEWORKS = UIKit Foundation QuartzCore UserNotifications
 
 include $(THEOS_MAKE_PATH)/tweak.mk

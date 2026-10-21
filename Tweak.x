@@ -1,8 +1,10 @@
-// WCPulseLite — three WeChat features extracted from WCPulse.dylib (arm64, MSHookMessageEx based).
+// WCPulseLite — WeChat features extracted from WCPulse.dylib (sections 1-3) and WCPush2Chat.dylib (section 4).
 // Each block below names the original function address it mirrors.
 #import <UIKit/UIKit.h>
+#import <UserNotifications/UserNotifications.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import "WCPLSpeedMath.h"
 
 #pragma mark - Settings (defaults = user's requested values)
@@ -21,6 +23,10 @@ static NSUserDefaults *WCPLDefaults(void) {
             @"WCPLVideoSpeed": @YES,
             @"WCPLLeftSpeed": @"2.0x",                // WCPulse default 0.5x; user wants 2.0x
             @"WCPLRightSpeed": @"2.0x",
+            @"WCPLPushFG": @YES,                      // 前台直达
+            @"WCPLPushBG": @YES,                      // 后台直达
+            @"WCPLPushFGMode": @0,                    // 0 全屏 / 1 半屏
+            @"WCPLPushBGMode": @0,
         }];
     });
     return d;
@@ -106,6 +112,73 @@ static void WCPLClearBG(id view) {
 %end
 %hook MFBannerBtn
 - (void)layoutSubviews { %orig; WCPLClearBG(self); }
+%end
+
+#pragma mark - 4. 消息直达 (WCPush2Chat 0x4bbc / 0x4e28 / 0x5530 / 0x5974)
+
+// Tapping a message notification opens that chat directly (full-screen push or half-screen sheet).
+@interface CContact : NSObject
+@property (nonatomic, copy) NSString *m_nsUsrName;
+@end
+@interface BaseMsgContentViewController : UIViewController
+- (CContact *)getChatContact;
+@end
+
+static id WCPLService(NSString *name) {
+    id center = [[%c(MMContext) performSelector:@selector(currentContext)] performSelector:@selector(serviceCenter)];
+    return [center performSelector:@selector(getService:) withObject:NSClassFromString(name)];
+}
+
+static UIViewController *WCPLTopVC(void) {
+    UIViewController *vc = UIApplication.sharedApplication.keyWindow.rootViewController;
+    for (;;) {
+        if (vc.presentedViewController) vc = vc.presentedViewController;
+        else if ([vc isKindOfClass:UITabBarController.class]) vc = ((UITabBarController *)vc).selectedViewController;
+        else if ([vc isKindOfClass:UINavigationController.class]) vc = ((UINavigationController *)vc).visibleViewController;
+        else return vc;
+    }
+}
+
+static void WCPLOpenChat(CContact *contact, UIViewController *vc, BOOL foreground) {
+    BOOL half = [WCPLDefaults() integerForKey:foreground ? @"WCPLPushFGMode" : @"WCPLPushBGMode"] == 1;
+    if (half)
+        [WCPLService(@"QuickReplyMsgMgr") performSelector:@selector(showPageSheetSession:fromViewController:) withObject:contact withObject:vc];
+    else
+        ((void (*)(id, SEL, id, id, BOOL))objc_msgSend)(WCPLService(@"MMMsgLogicManager"),
+            @selector(PushOtherBaseMsgControllerByContact:navigationController:animated:), contact, vc.navigationController, YES);
+}
+
+// UI may not be ready right after a cold launch: retry every 0.5s, give up after 10 tries (as the original).
+static void WCPLPushToChat(UNNotificationResponse *response, BOOL foreground) {
+    NSString *user = response.notification.request.content.userInfo[@"u"];
+    if (![user isKindOfClass:NSString.class]) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CContact *contact = [WCPLService(@"CContactMgr") performSelector:@selector(getContactByName:) withObject:user];
+        if (!contact) return;
+        __block int tries = 0;
+        [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+            UIViewController *top = WCPLTopVC();
+            if (!top.navigationController) { if (++tries >= 10) [t invalidate]; return; }
+            [t invalidate];
+            if (foreground && [top isKindOfClass:%c(BaseMsgContentViewController)] &&
+                [[(BaseMsgContentViewController *)top getChatContact].m_nsUsrName isEqualToString:user]) return;
+            WCPLOpenChat(contact, top, foreground);
+        }];
+    });
+}
+
+%hook MicroMessengerAppDelegate
+- (void)userNotificationCenter:(id)c didReceiveNotificationResponse:(UNNotificationResponse *)r withCompletionHandler:(id)h {
+    if (WCPLBool(@"WCPLPushBG")) WCPLPushToChat(r, NO);
+    %orig;
+}
+%end
+
+%hook NotificationActionsMgr
+- (void)userNotificationCenter:(id)c didReceiveNotificationResponse:(UNNotificationResponse *)r withCompletionHandler:(id)h {
+    if (WCPLBool(@"WCPLPushFG")) WCPLPushToChat(r, YES);
+    %orig;
+}
 %end
 
 #pragma mark - 3. 视频倍速手势 (0x9b2cc / 0x9b6dc / 0x9c884 / 0x116000)
