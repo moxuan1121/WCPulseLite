@@ -1,0 +1,33 @@
+name: Build tweak (roothide)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-roothide:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app || true
+      - name: Speed math test
+        run: clang -Wall -Werror -o speed_math_test Tests/speed_math_test.c -lm && ./speed_math_test
+      - name: Install ldid
+        run: brew install ldid || brew install ldid-procursus
+      - name: Install Theos (roothide)
+        run: |
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          git clone --recursive https://github.com/roothide/theos.git "$HOME/theos"
+          if ! ls "$HOME"/theos/sdks/iPhoneOS*.sdk >/dev/null 2>&1; then
+            git clone --depth=1 https://github.com/theos/sdks.git /tmp/sdks
+            cp -R /tmp/sdks/iPhoneOS*.sdk "$HOME/theos/sdks/"
+          fi
+      - name: Build
+        run: make FINALPACKAGE=1 package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WCPulseLite-roothide-deb
+          path: packages/*.deb
+          if-no-files-found: error

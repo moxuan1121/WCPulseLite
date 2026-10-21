@@ -1,0 +1,5 @@
+.theos/
+packages/
+*.o
+Tests/speed_math_test
+Tests/*.exe
