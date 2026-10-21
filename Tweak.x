@@ -28,6 +28,7 @@ static NSUserDefaults *WCPLDefaults(void) {
             @"WCPLPushFGMode": @0,                    // 0 全屏 / 1 半屏
             @"WCPLPushBGMode": @0,
             @"WCPLNoRevoke": @YES,                    // 防撤回
+            @"WCPLSwipeMsg": @YES,                    // 左滑消息引用/撤回
             @"WCPLTimeFormat": @"MM/dd HH:mm:ss",     // WCPulse default
         }];
     });
@@ -211,6 +212,7 @@ static NSArray<NSArray *> *WCPLRows(void) {
                   @[@"T", @"↳ 左侧倍速", @"WCPLLeftSpeed"],
                   @[@"T", @"↳ 右侧倍速", @"WCPLRightSpeed"]],
         @[@"消息", @[@"S", @"启用防撤回", @"WCPLNoRevoke"],
+                  @[@"S", @"左滑消息引用/撤回", @"WCPLSwipeMsg"],
                   @[@"T", @"↳ 撤回提示时间格式", @"WCPLTimeFormat"]],
         @[@"消息直达", @[@"S", @"开启前台直达", @"WCPLPushFG"],
                     @[@"M", @"↳ 前台直达模式", @"WCPLPushFGMode"],
@@ -317,7 +319,7 @@ static NSArray<NSArray *> *WCPLRows(void) {
 // Instead of letting WeChat delete the message, keep it and insert a local system note after it.
 @interface CMessageWrap : NSObject
 - (instancetype)initWithMsgType:(long long)type;
-@property (nonatomic, copy) NSString *m_nsContent, *m_nsFromUsr, *m_nsToUsr;
+@property (nonatomic, copy) NSString *m_nsContent, *m_nsFromUsr, *m_nsToUsr, *m_nsRealChatUsr;
 @property (nonatomic) unsigned int m_uiCreateTime, m_uiStatus;
 @end
 
@@ -361,6 +363,74 @@ static NSString *WCPLFormatTime(unsigned int t) {
     note.m_uiCreateTime = orig.m_uiCreateTime + 1;
     note.m_nsContent = [NSString stringWithFormat:@"%@ 已拦截%@撤回的消息", WCPLFormatTime(orig.m_uiCreateTime), name.length ? name : @"对方"];
     ((void (*)(id, SEL, id, id, BOOL, BOOL))objc_msgSend)(msgMgr, @selector(AddLocalMsg:MsgWrap:fixTime:NewMsgArriveNotify:), session, note, YES, NO);
+}
+%end
+
+#pragma mark - 7. 左滑消息 (WCPulse wcpulse_handleSwipeGesture: 0xe672c / onReplyMsg: 0xe8ce4)
+
+// Swipe left on a bubble: others' message -> 引用 / 引用并@ (group only); my message -> 撤回 / 引用.
+// Uses WeChat's own cell actions, same as the original: onShowMsgReplyMenuItem:, onRevokeMsg:, longPressOnHeadImage:.
+@interface CommonMessageCellView : UIView
+- (id)viewModel;
+@end
+
+static char kWCPLSwipe;
+static void WCPLHaptic(void);
+
+static UIViewController *WCPLOwnerVC(UIView *v) {
+    for (UIResponder *r = v; r; r = r.nextResponder)
+        if ([r isKindOfClass:%c(BaseMsgContentViewController)]) return (UIViewController *)r;
+    return nil;
+}
+
+static void WCPLCellAction(id cell, SEL sel) {
+    if ([cell respondsToSelector:sel]) ((void (*)(id, SEL, id))objc_msgSend)(cell, sel, nil);
+}
+
+%hook CommonMessageCellView
+- (void)layoutInternal {
+    %orig;
+    if (!WCPLBool(@"WCPLSwipeMsg") || objc_getAssociatedObject(self, &kWCPLSwipe)) return;
+    UISwipeGestureRecognizer *g = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(wcpl_swiped:)];
+    g.direction = UISwipeGestureRecognizerDirectionLeft;
+    [self addGestureRecognizer:g];
+    objc_setAssociatedObject(self, &kWCPLSwipe, g, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+%new
+- (void)wcpl_swiped:(UISwipeGestureRecognizer *)g {
+    if (!WCPLBool(@"WCPLSwipeMsg")) return;
+    CMessageWrap *msg = [[self viewModel] performSelector:@selector(messageWrap)];
+    UIViewController *vc = WCPLOwnerVC(self);
+    if (!msg || !vc) return;
+    NSString *me = [%c(SettingUtil) performSelector:@selector(getLocalUsrName:) withObject:nil];
+    BOOL mine = [msg.m_nsFromUsr isEqualToString:me];
+    NSString *realUsr = [msg respondsToSelector:@selector(m_nsRealChatUsr)] ? msg.m_nsRealChatUsr : nil;
+    BOOL group = [msg.m_nsFromUsr hasSuffix:@"@chatroom"] || [msg.m_nsToUsr hasSuffix:@"@chatroom"];
+    WCPLHaptic();
+
+    if (!mine && !(group && realUsr.length)) { WCPLCellAction(self, @selector(onShowMsgReplyMenuItem:)); return; }
+
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:nil message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak id cell = self;
+    [sheet addAction:[UIAlertAction actionWithTitle:@"引用" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        WCPLCellAction(cell, @selector(onShowMsgReplyMenuItem:));
+    }]];
+    if (mine) {
+        [sheet addAction:[UIAlertAction actionWithTitle:@"撤回" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+            WCPLCellAction(cell, @selector(onRevokeMsg:));
+        }]];
+    } else {
+        [sheet addAction:[UIAlertAction actionWithTitle:@"引用并@对方" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            WCPLCellAction(cell, @selector(onShowMsgReplyMenuItem:));
+            id contact = [WCPLService(@"CContactMgr") performSelector:@selector(getContactByName:) withObject:realUsr];
+            if (contact && [vc respondsToSelector:@selector(longPressOnHeadImage:)])
+                [vc performSelector:@selector(longPressOnHeadImage:) withObject:contact];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    sheet.popoverPresentationController.sourceView = self;
+    [vc presentViewController:sheet animated:YES completion:nil];
 }
 %end
 
