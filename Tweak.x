@@ -87,7 +87,8 @@ static CGFloat WCPLPad(void) { return [WCPLDefaults() doubleForKey:@"WCPLHomeCor
 - (void)layoutSubviews {
     %orig;
     UITableViewCell *cell = (UITableViewCell *)self;
-    if (!WCPLBool(@"WCPLHomeCorner") || ![cell.superview isKindOfClass:%c(MainFrameTableView)]) return;
+    // Original (0x1c2280..0x1c2318) checks cell.superview.superview, not cell.superview.
+    if (!WCPLBool(@"WCPLHomeCorner") || ![cell.superview.superview isKindOfClass:%c(MainFrameTableView)]) return;
     BOOL dark = UITraitCollection.currentTraitCollection.userInterfaceStyle == UIUserInterfaceStyleDark;
     cell.backgroundColor = WCPLHex([WCPLDefaults() stringForKey:dark ? @"WCPLHomeCornerDark" : @"WCPLHomeCornerLight"]);
     // Plain UIView children are WeChat's opaque backdrops; clear them so the cell color shows.
@@ -190,6 +191,116 @@ static void WCPLPushToChat(UNNotificationResponse *response, BOOL foreground) {
 - (void)userNotificationCenter:(id)c didReceiveNotificationResponse:(UNNotificationResponse *)r withCompletionHandler:(id)h {
     if (WCPLBool(@"WCPLPushFG")) WCPLPushToChat(r, YES);
     %orig;
+}
+%end
+
+#pragma mark - 5. 设置页 (entry mirrors WCPush2Chat 0x527c / 0x5498)
+
+// Row kinds: S = switch, T = text (alert input), M = 全屏/半屏 segment.
+static NSArray<NSArray *> *WCPLRows(void) {
+    return @[
+        @[@"置顶", @[@"S", @"启用置顶点击保留", @"WCPLTopClickKeep"]],
+        @[@"首页圆角（重启微信生效）", @[@"S", @"启用首页圆角", @"WCPLHomeCorner"],
+                                     @[@"T", @"↳ 上下间距", @"WCPLHomeCornerVPadding"],
+                                     @[@"T", @"↳ 背景颜色", @"WCPLHomeCornerLight"],
+                                     @[@"T", @"↳ 深色背景颜色", @"WCPLHomeCornerDark"]],
+        @[@"视频", @[@"S", @"启用视频倍速手势", @"WCPLVideoSpeed"],
+                  @[@"T", @"↳ 左侧倍速", @"WCPLLeftSpeed"],
+                  @[@"T", @"↳ 右侧倍速", @"WCPLRightSpeed"]],
+        @[@"消息直达", @[@"S", @"开启前台直达", @"WCPLPushFG"],
+                    @[@"M", @"↳ 前台直达模式", @"WCPLPushFGMode"],
+                    @[@"S", @"开启后台直达", @"WCPLPushBG"],
+                    @[@"M", @"↳ 后台直达模式", @"WCPLPushBGMode"]],
+    ];
+}
+
+@interface WCPLSettingsVC : UITableViewController
+@end
+
+@implementation WCPLSettingsVC
+- (instancetype)init {
+    if ((self = [super initWithStyle:UITableViewStyleInsetGrouped])) self.title = @"WCPulseLite";
+    return self;
+}
+- (NSArray *)row:(NSIndexPath *)ip { return WCPLRows()[ip.section][ip.row + 1]; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return WCPLRows().count; }
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return WCPLRows()[s].count - 1; }
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return WCPLRows()[s][0]; }
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    NSArray *r = [self row:ip];
+    NSString *kind = r[0], *key = r[2];
+    UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+    c.textLabel.text = r[1];
+    c.selectionStyle = UITableViewCellSelectionStyleNone;
+    if ([kind isEqualToString:@"S"]) {
+        UISwitch *sw = [UISwitch new];
+        sw.on = [WCPLDefaults() boolForKey:key];
+        sw.accessibilityIdentifier = key;
+        [sw addTarget:self action:@selector(toggled:) forControlEvents:UIControlEventValueChanged];
+        c.accessoryView = sw;
+    } else if ([kind isEqualToString:@"M"]) {
+        UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"全屏", @"半屏"]];
+        seg.selectedSegmentIndex = [WCPLDefaults() integerForKey:key];
+        seg.accessibilityIdentifier = key;
+        [seg addTarget:self action:@selector(segmented:) forControlEvents:UIControlEventValueChanged];
+        c.accessoryView = seg;
+    } else {
+        c.detailTextLabel.text = [WCPLDefaults() objectForKey:key] ? [[WCPLDefaults() objectForKey:key] description] : @"";
+        c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        c.selectionStyle = UITableViewCellSelectionStyleDefault;
+    }
+    return c;
+}
+
+- (void)toggled:(UISwitch *)sw { [WCPLDefaults() setBool:sw.on forKey:sw.accessibilityIdentifier]; }
+- (void)segmented:(UISegmentedControl *)s { [WCPLDefaults() setInteger:s.selectedSegmentIndex forKey:s.accessibilityIdentifier]; }
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+    NSArray *r = [self row:ip];
+    if (![r[0] isEqualToString:@"T"]) return;
+    NSString *key = r[2];
+    BOOL number = [key isEqualToString:@"WCPLHomeCornerVPadding"];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:r[1]
+        message:number ? @"0.0 - 50.0" : ([key hasPrefix:@"WCPLHomeCorner"] ? @"十六进制颜色，如 #F7F7F7" : @"如 2.0x")
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *f) {
+        f.text = [[WCPLDefaults() objectForKey:key] description];
+        if (number) f.keyboardType = UIKeyboardTypeDecimalPad;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+        NSString *v = [a.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if (number) [WCPLDefaults() setDouble:MIN(MAX(v.doubleValue, 0), 50) forKey:key];
+        else if (v.length) [WCPLDefaults() setObject:v forKey:key];
+        [tv reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+@end
+
+@interface NewSettingViewController : UIViewController
+@end
+
+%hook NewSettingViewController
+- (void)reloadTableData {
+    %orig;
+    Ivar iv = class_getInstanceVariable(object_getClass(self), "m_tableViewMgr");
+    id mgr = iv ? object_getIvar(self, iv) : nil;
+    if (!mgr) return;
+    id section = [%c(WCTableViewSectionManager) performSelector:@selector(defaultSection)];
+    id cell = ((id (*)(id, SEL, SEL, id, id, id, BOOL))objc_msgSend)(%c(WCTableViewNormalCellManager),
+        @selector(normalCellForSel:target:title:rightValue:canRightValueCopy:),
+        @selector(wcpl_openSettings), self, @"WCPulseLite", @"", NO);
+    [section performSelector:@selector(addCell:) withObject:cell];
+    ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(mgr, @selector(insertSection:At:), section, 0);
+    [[mgr performSelector:@selector(getTableView)] reloadData];
+}
+
+%new
+- (void)wcpl_openSettings {
+    [self.navigationController pushViewController:[WCPLSettingsVC new] animated:YES];
 }
 %end
 
