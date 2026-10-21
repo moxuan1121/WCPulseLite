@@ -28,11 +28,7 @@ static NSUserDefaults *WCPLDefaults(void) {
             @"WCPLPushFGMode": @0,                    // 0 全屏 / 1 半屏
             @"WCPLPushBGMode": @0,
             @"WCPLNoRevoke": @YES,                    // 防撤回
-            @"WCPLTimeLabel": @YES,                   // 消息具体时间
             @"WCPLTimeFormat": @"MM/dd HH:mm:ss",     // WCPulse default
-            @"WCPLTimeFontSize": @7.0,                // WCPulse default
-            @"WCPLTimeColor": @"#8E8E93",             // light mode
-            @"WCPLTimeColorDark": @"#8E8E93",
         }];
     });
     return d;
@@ -215,11 +211,7 @@ static NSArray<NSArray *> *WCPLRows(void) {
                   @[@"T", @"↳ 左侧倍速", @"WCPLLeftSpeed"],
                   @[@"T", @"↳ 右侧倍速", @"WCPLRightSpeed"]],
         @[@"消息", @[@"S", @"启用防撤回", @"WCPLNoRevoke"],
-                  @[@"S", @"显示消息具体时间", @"WCPLTimeLabel"],
-                  @[@"T", @"↳ 时间格式", @"WCPLTimeFormat"],
-                  @[@"T", @"↳ 时间字号", @"WCPLTimeFontSize"],
-                  @[@"T", @"↳ 时间颜色", @"WCPLTimeColor"],
-                  @[@"T", @"↳ 深色时间颜色", @"WCPLTimeColorDark"]],
+                  @[@"T", @"↳ 撤回提示时间格式", @"WCPLTimeFormat"]],
         @[@"消息直达", @[@"S", @"开启前台直达", @"WCPLPushFG"],
                     @[@"M", @"↳ 前台直达模式", @"WCPLPushFGMode"],
                     @[@"S", @"开启后台直达", @"WCPLPushBG"],
@@ -274,10 +266,9 @@ static NSArray<NSArray *> *WCPLRows(void) {
     NSArray *r = [self row:ip];
     if (![r[0] isEqualToString:@"T"]) return;
     NSString *key = r[2];
-    BOOL fontSize = [key isEqualToString:@"WCPLTimeFontSize"];
-    BOOL number = fontSize || [key isEqualToString:@"WCPLHomeCornerVPadding"];
-    BOOL color = [key hasPrefix:@"WCPLHomeCorner"] || [key hasPrefix:@"WCPLTimeColor"];
-    double lo = fontSize ? 4 : 0, hi = fontSize ? 20 : 50;
+    BOOL number = [key isEqualToString:@"WCPLHomeCornerVPadding"];
+    BOOL color = [key hasPrefix:@"WCPLHomeCorner"];
+    double lo = 0, hi = 50;
     UIAlertController *a = [UIAlertController alertControllerWithTitle:r[1]
         message:number ? [NSString stringWithFormat:@"%.1f - %.1f", lo, hi] : (color ? @"十六进制颜色，如 #F7F7F7" :
                  [key isEqualToString:@"WCPLTimeFormat"] ? @"如 MM/dd HH:mm:ss" : @"如 2.0x")
@@ -370,43 +361,6 @@ static NSString *WCPLFormatTime(unsigned int t) {
     note.m_uiCreateTime = orig.m_uiCreateTime + 1;
     note.m_nsContent = [NSString stringWithFormat:@"%@ 已拦截%@撤回的消息", WCPLFormatTime(orig.m_uiCreateTime), name.length ? name : @"对方"];
     ((void (*)(id, SEL, id, id, BOOL, BOOL))objc_msgSend)(msgMgr, @selector(AddLocalMsg:MsgWrap:fixTime:NewMsgArriveNotify:), session, note, YES, NO);
-}
-%end
-
-#pragma mark - 7. 消息具体时间 (WCPulse -[CommonMessageCellView wcpulse_setupTimeLabelAndGesture] 0xe4630)
-
-// Small label under each avatar with the message's send time (font 7, width = 6x font, height = 1.5x font).
-@interface CommonMessageCellView : UIView
-- (id)viewModel;
-- (UIView *)getHeadImageView;
-@end
-
-static const NSInteger kWCPLTimeTag = 10087;   // original tag
-
-%hook CommonMessageCellView
-- (void)layoutInternal {
-    %orig;
-    UIView *head = [self getHeadImageView];
-    UILabel *label = (UILabel *)[self viewWithTag:kWCPLTimeTag];
-    CMessageWrap *msg = [[self viewModel] performSelector:@selector(messageWrap)];
-    if (!WCPLBool(@"WCPLTimeLabel") || !head || head.hidden || !msg) { label.hidden = YES; return; }
-    if (!label) {
-        label = [UILabel new];
-        label.tag = kWCPLTimeTag;
-        label.textAlignment = NSTextAlignmentCenter;
-        label.adjustsFontSizeToFitWidth = YES;
-        label.minimumScaleFactor = 0.5;
-        [self addSubview:label];
-    }
-    CGFloat size = [WCPLDefaults() doubleForKey:@"WCPLTimeFontSize"];
-    BOOL dark = self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark;
-    label.font = [UIFont systemFontOfSize:size];
-    label.textColor = WCPLHex([WCPLDefaults() stringForKey:dark ? @"WCPLTimeColorDark" : @"WCPLTimeColor"]);
-    // Original geometry: width = 6 x font size, height = 1.5 x font size, under the avatar.
-    CGRect h = [self convertRect:head.bounds fromView:head];
-    label.frame = CGRectMake(CGRectGetMidX(h) - size * 3, CGRectGetMaxY(h) + 1, size * 6, size * 1.5);
-    label.text = WCPLFormatTime(msg.m_uiCreateTime);
-    label.hidden = NO;
 }
 %end
 
