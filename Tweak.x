@@ -27,6 +27,9 @@ static NSUserDefaults *WCPLDefaults(void) {
             @"WCPLPushBG": @YES,                      // 后台直达
             @"WCPLPushFGMode": @0,                    // 0 全屏 / 1 半屏
             @"WCPLPushBGMode": @0,
+            @"WCPLNoRevoke": @YES,                    // 防撤回
+            @"WCPLTimeLabel": @YES,                   // 消息具体时间
+            @"WCPLTimeFormat": @"MM/dd HH:mm:ss",     // WCPulse default
         }];
     });
     return d;
@@ -208,6 +211,9 @@ static NSArray<NSArray *> *WCPLRows(void) {
         @[@"视频", @[@"S", @"启用视频倍速手势", @"WCPLVideoSpeed"],
                   @[@"T", @"↳ 左侧倍速", @"WCPLLeftSpeed"],
                   @[@"T", @"↳ 右侧倍速", @"WCPLRightSpeed"]],
+        @[@"消息", @[@"S", @"启用防撤回", @"WCPLNoRevoke"],
+                  @[@"S", @"显示消息具体时间", @"WCPLTimeLabel"],
+                  @[@"T", @"↳ 时间格式", @"WCPLTimeFormat"]],
         @[@"消息直达", @[@"S", @"开启前台直达", @"WCPLPushFG"],
                     @[@"M", @"↳ 前台直达模式", @"WCPLPushFGMode"],
                     @[@"S", @"开启后台直达", @"WCPLPushBG"],
@@ -264,7 +270,8 @@ static NSArray<NSArray *> *WCPLRows(void) {
     NSString *key = r[2];
     BOOL number = [key isEqualToString:@"WCPLHomeCornerVPadding"];
     UIAlertController *a = [UIAlertController alertControllerWithTitle:r[1]
-        message:number ? @"0.0 - 50.0" : ([key hasPrefix:@"WCPLHomeCorner"] ? @"十六进制颜色，如 #F7F7F7" : @"如 2.0x")
+        message:number ? @"0.0 - 50.0" : ([key hasPrefix:@"WCPLHomeCorner"] ? @"十六进制颜色，如 #F7F7F7" :
+                 [key isEqualToString:@"WCPLTimeFormat"] ? @"如 MM/dd HH:mm:ss" : @"如 2.0x")
         preferredStyle:UIAlertControllerStyleAlert];
     [a addTextFieldWithConfigurationHandler:^(UITextField *f) {
         f.text = [[WCPLDefaults() objectForKey:key] description];
@@ -302,6 +309,92 @@ static NSArray<NSArray *> *WCPLRows(void) {
 %new
 - (void)wcpl_openSettings {
     [self.navigationController pushViewController:[WCPLSettingsVC new] animated:YES];
+}
+%end
+
+#pragma mark - 6. 防撤回 (WCPulse -[MessageRevokeMgr onRevokeMsg:] 0x10588c)
+
+// Instead of letting WeChat delete the message, keep it and insert a local system note after it.
+@interface CMessageWrap : NSObject
+- (instancetype)initWithMsgType:(long long)type;
+@property (nonatomic, copy) NSString *m_nsContent, *m_nsFromUsr, *m_nsToUsr;
+@property (nonatomic) unsigned int m_uiCreateTime, m_uiStatus;
+@end
+
+static NSString *WCPLXMLValue(NSString *xml, NSString *tag) {
+    NSRange a = [xml rangeOfString:[NSString stringWithFormat:@"<%@>", tag]];
+    NSRange b = [xml rangeOfString:[NSString stringWithFormat:@"</%@>", tag]];
+    if (a.location == NSNotFound || b.location == NSNotFound || b.location < NSMaxRange(a)) return nil;
+    NSString *v = [xml substringWithRange:NSMakeRange(NSMaxRange(a), b.location - NSMaxRange(a))];
+    if ([v hasPrefix:@"<![CDATA["] && [v hasSuffix:@"]]>"]) v = [v substringWithRange:NSMakeRange(9, v.length - 12)];
+    return v;
+}
+
+static NSString *WCPLFormatTime(unsigned int t) {
+    NSDateFormatter *f = [NSDateFormatter new];
+    f.dateFormat = [WCPLDefaults() stringForKey:@"WCPLTimeFormat"];
+    return [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:t]];
+}
+
+%hook MessageRevokeMgr
+- (void)onRevokeMsg:(CMessageWrap *)wrap {
+    if (!WCPLBool(@"WCPLNoRevoke")) {
+        %orig;
+        return;
+    }
+    NSString *xml = wrap.m_nsContent, *session = WCPLXMLValue(xml, @"session") ?: wrap.m_nsFromUsr;
+    NSString *svrID = WCPLXMLValue(xml, @"newmsgid"), *replace = WCPLXMLValue(xml, @"replacemsg") ?: @"";
+    id msgMgr = WCPLService(@"CMessageMgr");
+    CMessageWrap *orig = svrID ? ((id (*)(id, SEL, id, long long))objc_msgSend)(msgMgr, @selector(GetMsg:n64SvrID:), session, svrID.longLongValue) : nil;
+    // My own revokes ("你撤回了一条消息") and unknown messages go through normally.
+    if (!orig || [replace hasPrefix:@"你"]) {
+        %orig;
+        return;
+    }
+
+    NSString *name = [[replace componentsSeparatedByString:@"撤回了"].firstObject
+        stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"\"“” "]];
+    CMessageWrap *note = [[%c(CMessageWrap) alloc] initWithMsgType:10000];   // system tip
+    note.m_nsFromUsr = orig.m_nsFromUsr;
+    note.m_nsToUsr = orig.m_nsToUsr;
+    note.m_uiStatus = 4;
+    note.m_uiCreateTime = orig.m_uiCreateTime + 1;
+    note.m_nsContent = [NSString stringWithFormat:@"%@ 已拦截%@撤回的消息", WCPLFormatTime(orig.m_uiCreateTime), name.length ? name : @"对方"];
+    ((void (*)(id, SEL, id, id, BOOL, BOOL))objc_msgSend)(msgMgr, @selector(AddLocalMsg:MsgWrap:fixTime:NewMsgArriveNotify:), session, note, YES, NO);
+}
+%end
+
+#pragma mark - 7. 消息具体时间 (WCPulse -[CommonMessageCellView wcpulse_setupTimeLabelAndGesture] 0xe4630)
+
+// Small label under each avatar with the message's send time (font 7, width = 6x font, height = 1.5x font).
+@interface CommonMessageCellView : UIView
+- (id)viewModel;
+- (UIView *)getHeadImageView;
+@end
+
+static const NSInteger kWCPLTimeTag = 10087;   // original tag
+
+%hook CommonMessageCellView
+- (void)layoutInternal {
+    %orig;
+    UIView *head = [self getHeadImageView];
+    UILabel *label = (UILabel *)[self viewWithTag:kWCPLTimeTag];
+    CMessageWrap *msg = [[self viewModel] performSelector:@selector(messageWrap)];
+    if (!WCPLBool(@"WCPLTimeLabel") || !head || head.hidden || !msg) { label.hidden = YES; return; }
+    if (!label) {
+        label = [UILabel new];
+        label.tag = kWCPLTimeTag;
+        label.font = [UIFont systemFontOfSize:7];
+        label.textColor = UIColor.secondaryLabelColor;
+        label.textAlignment = NSTextAlignmentCenter;
+        label.adjustsFontSizeToFitWidth = YES;
+        label.minimumScaleFactor = 0.5;
+        [self addSubview:label];
+    }
+    CGRect h = [self convertRect:head.bounds fromView:head];
+    label.frame = CGRectMake(CGRectGetMidX(h) - 21, CGRectGetMaxY(h) + 1, 42, 10.5);
+    label.text = WCPLFormatTime(msg.m_uiCreateTime);
+    label.hidden = NO;
 }
 %end
 
