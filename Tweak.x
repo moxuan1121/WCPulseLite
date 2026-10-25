@@ -30,6 +30,7 @@ static NSUserDefaults *WCPLDefaults(void) {
             @"WCPLNoRevoke": @YES,                    // 防撤回
             @"WCPLSwipeMsg": @YES,                    // 左滑消息引用/撤回
             @"WCPLTimeFormat": @"MM/dd HH:mm:ss",     // WCPulse default
+            @"WCPLEmptyInputVoice": @YES,             // 空输入框长按语音
         }];
     });
     return d;
@@ -214,6 +215,7 @@ static NSArray<NSArray *> *WCPLRows(void) {
         @[@"消息", @[@"S", @"启用防撤回", @"WCPLNoRevoke"],
                   @[@"S", @"左滑消息引用/撤回", @"WCPLSwipeMsg"],
                   @[@"T", @"↳ 撤回提示时间格式", @"WCPLTimeFormat"]],
+        @[@"输入框", @[@"S", @"空输入框长按语音", @"WCPLEmptyInputVoice"]],
         @[@"消息直达", @[@"S", @"开启前台直达", @"WCPLPushFG"],
                     @[@"M", @"↳ 前台直达模式", @"WCPLPushFGMode"],
                     @[@"S", @"开启后台直达", @"WCPLPushBG"],
@@ -647,6 +649,142 @@ static void WCPLPrioritize(UIView *view, UIGestureRecognizer *ours) {
     }
     UIView *v = ((UIGestureRecognizer *)self).view;
     if (v && WCPLIsEdge([self touchBeginPoint].x, v.bounds.size.width)) return;
+    %orig;
+}
+%end
+
+
+#pragma mark - 9. 空输入框长按语音 (WCPulse MMTextView 0xa8f48..0xaae90, MMInputToolView 0xd9a3c..0xda640)
+
+// Long-pressing the empty text field records voice, as if holding WeChat's own "按住 说话" button.
+// The text view hands its touches to -[MMInputToolView MMTransparentButton_touches*]; recording only
+// starts after 0.3s so a quick tap still focuses the keyboard. Unlike WCPulse, the text view keeps its
+// normal touch handling until recording actually starts (WCPulse swallowed taps on an empty field).
+@interface MMInputToolView : UIView
+- (void)MMTransparentButton_touchesBegan:(NSSet *)t withEvent:(UIEvent *)e;
+- (void)MMTransparentButton_touchesMoved:(NSSet *)t withEvent:(UIEvent *)e;
+- (void)MMTransparentButton_touchesEnded:(NSSet *)t withEvent:(UIEvent *)e;
+- (void)MMTransparentButton_touchesCancelled:(NSSet *)t withEvent:(UIEvent *)e;
+@end
+@interface MMTextView : UITextView
+- (id)m_delegate;
+- (UILongPressGestureRecognizer *)longPressGesture;
+@end
+
+static char kVoicePending, kVoiceActive, kVoiceDisabledGR;
+static BOOL gVoiceBlockMode2;   // WCPulse 0xa25e48: for 2s after recording, keep WeChat out of input mode 2
+
+// 0x11f130: empty after removing zero-width chars and whitespace.
+static BOOL WCPLTextEmpty(NSString *s) {
+    if (![s isKindOfClass:NSString.class] || !s.length) return YES;
+    s = [[s stringByReplacingOccurrencesOfString:@"\u200b" withString:@""] stringByReplacingOccurrencesOfString:@"\ufeff" withString:@""];
+    return [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].length == 0;
+}
+
+// m_delegate is MMGrowTextView, whose m_delegate is MMInputToolView.
+static MMInputToolView *WCPLToolView(MMTextView *tv) {
+    id d = [tv respondsToSelector:@selector(m_delegate)] ? [tv m_delegate] : nil;
+    if ([d isKindOfClass:%c(MMGrowTextView)] && [d respondsToSelector:@selector(m_delegate)]) d = [d m_delegate];
+    return [d respondsToSelector:@selector(MMTransparentButton_touchesBegan:withEvent:)] ? d : nil;
+}
+
+static void WCPLVoiceCancelPending(MMTextView *tv) {
+    dispatch_block_t b = objc_getAssociatedObject(tv, &kVoicePending);
+    if (b) dispatch_block_cancel(b);
+    objc_setAssociatedObject(tv, &kVoicePending, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void WCPLVoiceRestoreGestures(MMTextView *tv) {
+    for (UIGestureRecognizer *g in tv.gestureRecognizers) {
+        if (![objc_getAssociatedObject(g, &kVoiceDisabledGR) boolValue]) continue;
+        g.enabled = YES;
+        objc_setAssociatedObject(g, &kVoiceDisabledGR, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+%hook MMTextView
+// 0xa8f48: the text loupe must not start before our 0.3s voice delay.
+- (UILongPressGestureRecognizer *)longPressGesture {
+    UILongPressGestureRecognizer *g = %orig;
+    if (WCPLBool(@"WCPLEmptyInputVoice") && g.minimumPressDuration < 0.5) g.minimumPressDuration = 0.5;
+    return g;
+}
+
+// 0xa9b0c: no loupe/select menu on an empty field.
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
+    if (WCPLBool(@"WCPLEmptyInputVoice") && [self respondsToSelector:@selector(longPressGesture)] &&
+        g == [self longPressGesture] && WCPLTextEmpty(self.text)) return NO;
+    return %orig;
+}
+
+- (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event {
+    %orig;
+    if (!WCPLBool(@"WCPLEmptyInputVoice") || touches.count != 1 || !WCPLTextEmpty(self.text)) return;
+    if ([objc_getAssociatedObject(self, &kVoiceActive) boolValue] || !WCPLToolView(self)) return;
+    WCPLVoiceCancelPending(self);
+    __weak MMTextView *weakSelf = self;
+    dispatch_block_t start = dispatch_block_create(0, ^{
+        MMTextView *tv = weakSelf;
+        if (!tv) return;
+        objc_setAssociatedObject(tv, &kVoicePending, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        MMInputToolView *tool = WCPLToolView(tv);
+        if (!tool || !WCPLTextEmpty(tv.text)) return;
+        objc_setAssociatedObject(tv, &kVoiceActive, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (tv.isFirstResponder) [tv resignFirstResponder];
+        // 0xaa1c8: disabling cancels the text view's own tap/loupe gestures for this touch.
+        for (UIGestureRecognizer *g in tv.gestureRecognizers) {
+            if (!g.enabled) continue;
+            g.enabled = NO;
+            objc_setAssociatedObject(g, &kVoiceDisabledGR, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        [tool MMTransparentButton_touchesBegan:touches withEvent:event];
+    });
+    objc_setAssociatedObject(self, &kVoicePending, start, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), start);
+}
+
+- (void)touchesMoved:(NSSet *)touches withEvent:(UIEvent *)event {
+    if (![objc_getAssociatedObject(self, &kVoiceActive) boolValue]) {
+        %orig;
+        return;
+    }
+    [WCPLToolView(self) MMTransparentButton_touchesMoved:touches withEvent:event];
+}
+
+- (void)touchesEnded:(NSSet *)touches withEvent:(UIEvent *)event {
+    WCPLVoiceCancelPending(self);
+    if (![objc_getAssociatedObject(self, &kVoiceActive) boolValue]) {
+        %orig;
+        return;
+    }
+    objc_setAssociatedObject(self, &kVoiceActive, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    WCPLVoiceRestoreGestures(self);
+    [WCPLToolView(self) MMTransparentButton_touchesEnded:touches withEvent:event];
+    gVoiceBlockMode2 = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        gVoiceBlockMode2 = NO;
+    });
+}
+
+- (void)touchesCancelled:(NSSet *)touches withEvent:(UIEvent *)event {
+    WCPLVoiceCancelPending(self);
+    if (![objc_getAssociatedObject(self, &kVoiceActive) boolValue]) {
+        %orig;
+        return;
+    }
+    objc_setAssociatedObject(self, &kVoiceActive, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    WCPLVoiceRestoreGestures(self);
+    [WCPLToolView(self) MMTransparentButton_touchesCancelled:touches withEvent:event];
+}
+%end
+
+%hook MMInputToolView
+// 0xda640: right after a voice send WeChat switches to mode 2; WCPulse keeps mode 1 instead.
+- (void)setInputMode:(long long)mode animated:(BOOL)animated {
+    if (gVoiceBlockMode2 && mode == 2) {
+        %orig(1, animated);
+        return;
+    }
     %orig;
 }
 %end
