@@ -1,6 +1,6 @@
 Package: com.moxuan.wcpulselite
 Name: WCPulseLite
-Version: 0.1.0
+Version: 0.1.1
 Architecture: iphoneos-arm64e
 Description: 置顶点击保留 / 首页圆角 / 视频两侧长按倍速 / 消息直达
 Maintainer: moxuan

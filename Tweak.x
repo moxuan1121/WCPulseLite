@@ -487,7 +487,7 @@ static void WCPLHookReferTap(void) {
     SEL sel = @selector(handleTapForReferMsg:);
     unsigned n = 0;
     Class *all = objc_copyClassList(&n);
-    NSMutableString *hooked = [NSMutableString stringWithString:@"refer hooks:"];
+    NSMutableString *hooked = [NSMutableString stringWithString:@"v0.1.1 refer hooks:"];
     NSMutableString *sels = [NSMutableString stringWithString:@"refer sels:"];
     for (unsigned i = 0; i < n; i++) {
         Class c = all[i];
