@@ -445,16 +445,20 @@ static void WCPLCellAction(id cell, SEL sel) {
 // WCPulse scrolls the chat to it instead of WeChat's preview. Images (3) / videos (43, 62) keep the
 // native preview unless their own switch is on.
 - (void)handleTapForReferMsg:(id)ref {
-    if (!WCPLBool(@"WCPLReferJump") || ![ref isKindOfClass:%c(CMessageWrap)]) { %orig; return; }
-    unsigned type = [ref m_uiMessageType];
-    if ((type == 3 && !WCPLBool(@"WCPLReferJumpImage")) ||
-        ((type == 43 || type == 62) && !WCPLBool(@"WCPLReferJumpVideo"))) { %orig; return; }
+    BOOL jump = WCPLBool(@"WCPLReferJump") && [ref isKindOfClass:%c(CMessageWrap)];
+    unsigned type = jump ? [ref m_uiMessageType] : 0;
+    if (type == 3 && !WCPLBool(@"WCPLReferJumpImage")) jump = NO;
+    if ((type == 43 || type == 62) && !WCPLBool(@"WCPLReferJumpVideo")) jump = NO;
     SEL scroll = @selector(scrollToMessage:highlight:marginTop:animated:);
-    id vc = [self respondsToSelector:@selector(getViewController)] ? [self performSelector:@selector(getViewController)] : nil;
-    if (![vc respondsToSelector:scroll] && [self respondsToSelector:@selector(getCurrentViewController)])
+    id vc = nil;
+    if (jump && [self respondsToSelector:@selector(getViewController)]) vc = [self performSelector:@selector(getViewController)];
+    if (jump && ![vc respondsToSelector:scroll] && [self respondsToSelector:@selector(getCurrentViewController)])
         vc = [self performSelector:@selector(getCurrentViewController)];
-    if (![vc respondsToSelector:scroll]) vc = WCPLOwnerVC(self);
-    if (![vc respondsToSelector:scroll]) { %orig; return; }
+    if (jump && ![vc respondsToSelector:scroll]) vc = WCPLOwnerVC(self);
+    if (![vc respondsToSelector:scroll]) {
+        %orig;
+        return;
+    }
     ((void (*)(id, SEL, id, BOOL, double, BOOL))objc_msgSend)(vc, scroll, ref, YES, UIScreen.mainScreen.bounds.size.height / 3, YES);
 }
 %end
