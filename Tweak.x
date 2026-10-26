@@ -31,6 +31,9 @@ static NSUserDefaults *WCPLDefaults(void) {
             @"WCPLSwipeMsg": @YES,                    // 左滑消息引用/撤回
             @"WCPLTimeFormat": @"MM/dd HH:mm:ss",     // WCPulse default
             @"WCPLEmptyInputVoice": @YES,             // 空输入框长按语音
+            @"WCPLReferJump": @YES,                   // 点击引用跳转到原消息
+            @"WCPLReferJumpImage": @NO,               // 引用的是图片时也跳转（关=原生打开图片）
+            @"WCPLReferJumpVideo": @NO,               // 引用的是视频时也跳转（关=原生播放）
         }];
     });
     return d;
@@ -215,6 +218,9 @@ static NSArray<NSArray *> *WCPLRows(void) {
         @[@"消息", @[@"S", @"启用防撤回", @"WCPLNoRevoke"],
                   @[@"S", @"左滑消息引用/撤回", @"WCPLSwipeMsg"],
                   @[@"T", @"↳ 撤回提示时间格式", @"WCPLTimeFormat"]],
+        @[@"引用", @[@"S", @"点击引用跳转到原消息", @"WCPLReferJump"],
+                  @[@"S", @"↳ 引用图片也跳转", @"WCPLReferJumpImage"],
+                  @[@"S", @"↳ 引用视频也跳转", @"WCPLReferJumpVideo"]],
         @[@"输入框", @[@"S", @"空输入框长按语音", @"WCPLEmptyInputVoice"]],
         @[@"消息直达", @[@"S", @"开启前台直达", @"WCPLPushFG"],
                     @[@"M", @"↳ 前台直达模式", @"WCPLPushFGMode"],
@@ -322,7 +328,7 @@ static NSArray<NSArray *> *WCPLRows(void) {
 @interface CMessageWrap : NSObject
 - (instancetype)initWithMsgType:(long long)type;
 @property (nonatomic, copy) NSString *m_nsContent, *m_nsFromUsr, *m_nsToUsr, *m_nsRealChatUsr;
-@property (nonatomic) unsigned int m_uiCreateTime, m_uiStatus;
+@property (nonatomic) unsigned int m_uiCreateTime, m_uiStatus, m_uiMessageType;
 @end
 
 static NSString *WCPLXMLValue(NSString *xml, NSString *tag) {
@@ -433,6 +439,23 @@ static void WCPLCellAction(id cell, SEL sel) {
     [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     sheet.popoverPresentationController.sourceView = self;
     [vc presentViewController:sheet animated:YES completion:nil];
+}
+
+// 7b. 点击引用跳转 (WCPulse handleTapForReferMsg: 0x7378c0). The argument is the quoted CMessageWrap;
+// WCPulse scrolls the chat to it instead of WeChat's preview. Images (3) / videos (43, 62) keep the
+// native preview unless their own switch is on.
+- (void)handleTapForReferMsg:(id)ref {
+    if (!WCPLBool(@"WCPLReferJump") || ![ref isKindOfClass:%c(CMessageWrap)]) { %orig; return; }
+    unsigned type = [ref m_uiMessageType];
+    if ((type == 3 && !WCPLBool(@"WCPLReferJumpImage")) ||
+        ((type == 43 || type == 62) && !WCPLBool(@"WCPLReferJumpVideo"))) { %orig; return; }
+    SEL scroll = @selector(scrollToMessage:highlight:marginTop:animated:);
+    id vc = [self respondsToSelector:@selector(getViewController)] ? [self performSelector:@selector(getViewController)] : nil;
+    if (![vc respondsToSelector:scroll] && [self respondsToSelector:@selector(getCurrentViewController)])
+        vc = [self performSelector:@selector(getCurrentViewController)];
+    if (![vc respondsToSelector:scroll]) vc = WCPLOwnerVC(self);
+    if (![vc respondsToSelector:scroll]) { %orig; return; }
+    ((void (*)(id, SEL, id, BOOL, double, BOOL))objc_msgSend)(vc, scroll, ref, YES, UIScreen.mainScreen.bounds.size.height / 3, YES);
 }
 %end
 
