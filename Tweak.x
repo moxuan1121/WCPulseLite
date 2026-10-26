@@ -447,18 +447,7 @@ static void WCPLCellAction(id cell, SEL sel) {
 
 // The argument is the quoted CMessageWrap; WCPulse scrolls the chat to it instead of WeChat's preview.
 // Images (3) / videos (43, 62) keep the native preview unless their own switch is on.
-// WCPulse hooks only CommonMessageCellView, but a cell subclass that overrides the method bypasses that,
-// so every WeChat class owning handleTapForReferMsg: is hooked (each block keeps its own orig).
-// Diagnostics: Documents/WCPulseLite.log inside WeChat's container.
-static void WCPLLog(NSString *s) {
-    NSString *path = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"WCPulseLite.log"];
-    NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (!h) { [NSData.data writeToFile:path atomically:NO]; h = [NSFileHandle fileHandleForWritingAtPath:path]; }
-    [h seekToEndOfFile];
-    [h writeData:[[NSString stringWithFormat:@"%@ %@\n", NSDate.date, s] dataUsingEncoding:NSUTF8StringEncoding]];
-    [h closeFile];
-}
-
+// WCPulse hooks CommonMessageCellView, but on this WeChat only TextMessageCellView implements it (device log).
 static BOOL WCPLReferJump(UIView *cell, id ref) {
     if (!WCPLBool(@"WCPLReferJump") || ![ref isKindOfClass:%c(CMessageWrap)]) return NO;
     unsigned type = [ref m_uiMessageType];
@@ -469,64 +458,17 @@ static BOOL WCPLReferJump(UIView *cell, id ref) {
     if ([cell respondsToSelector:@selector(getViewController)]) [cands addObject:[cell performSelector:@selector(getViewController)] ?: NSNull.null];
     if ([cell respondsToSelector:@selector(getCurrentViewController)]) [cands addObject:[cell performSelector:@selector(getCurrentViewController)] ?: NSNull.null];
     for (UIResponder *r = cell; r; r = r.nextResponder) if ([r isKindOfClass:UIViewController.class]) [cands addObject:r];
-    NSMutableString *trace = [NSMutableString stringWithFormat:@"tap cell=%@ type=%u cands:", cell.class, type];
     for (id vc in cands) {
-        BOOL ok = [vc respondsToSelector:scroll];
-        [trace appendFormat:@" %@=%d", [vc class], ok];
-        if (!ok) continue;
-        WCPLLog(trace);
+        if (![vc respondsToSelector:scroll]) continue;
         ((void (*)(id, SEL, id, BOOL, double, BOOL))objc_msgSend)(vc, scroll, ref, YES, UIScreen.mainScreen.bounds.size.height / 3, YES);
         return YES;
     }
-    WCPLLog(trace);
     return NO;
 }
 
-// Scan every class in WeChat.app (frameworks included) instead of image 0 + name filter.
-static void WCPLHookReferTap(void) {
-    SEL sel = @selector(handleTapForReferMsg:);
-    unsigned n = 0;
-    Class *all = objc_copyClassList(&n);
-    NSMutableString *hooked = [NSMutableString stringWithString:@"v0.1.1 refer hooks:"];
-    NSMutableString *sels = [NSMutableString stringWithString:@"refer sels:"];
-    for (unsigned i = 0; i < n; i++) {
-        Class c = all[i];
-        const char *img = class_getImageName(c);
-        if (!img || !strstr(img, ".app/")) continue;
-        unsigned mc = 0;
-        Method *ms = class_copyMethodList(c, &mc);
-        for (unsigned j = 0; j < mc; j++) {
-            const char *s = sel_getName(method_getName(ms[j]));
-            if (strcasestr(s, "refer") && (strcasestr(s, "tap") || strcasestr(s, "click") || strcasestr(s, "jump")))
-                [sels appendFormat:@" %s.%s", class_getName(c), s];
-            if (method_getName(ms[j]) != sel) continue;
-            IMP orig = method_getImplementation(ms[j]);
-            method_setImplementation(ms[j], imp_implementationWithBlock(^(UIView *v, id ref) {
-                if (!WCPLReferJump(v, ref)) ((void (*)(id, SEL, id))orig)(v, sel, ref);
-            }));
-            [hooked appendFormat:@" %s", class_getName(c)];
-        }
-        free(ms);
-    }
-    free(all);
-    WCPLLog(hooked);
-    WCPLLog(sels);
-}
-
-// Temporary: log the view chain + gesture targets under the first 30 taps, to find WeChat's real quote-tap action.
-%hook UIWindow
-- (void)sendEvent:(UIEvent *)e {
-    %orig;
-    static int left = 30;
-    UITouch *t = e.allTouches.anyObject;
-    if (left <= 0 || t.phase != UITouchPhaseEnded) return;
-    left--;
-    NSMutableString *s = [NSMutableString stringWithString:@"tap chain:"];
-    for (UIView *v = t.view; v && s.length < 3000; v = v.superview) {
-        [s appendFormat:@"\n  %@", v.class];
-        for (UIGestureRecognizer *g in v.gestureRecognizers) [s appendFormat:@"\n    %@", g];
-    }
-    WCPLLog(s);
+%hook TextMessageCellView
+- (void)handleTapForReferMsg:(id)ref {
+    if (!WCPLReferJump(self, ref)) %orig;
 }
 %end
 
@@ -883,7 +825,3 @@ static void WCPLVoiceRestoreGestures(MMTextView *tv) {
 }
 %end
 
-%ctor {
-    %init;
-    WCPLHookReferTap();
-}
