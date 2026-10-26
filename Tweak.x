@@ -5,7 +5,6 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <mach-o/dyld.h>
 #import "WCPLSpeedMath.h"
 
 #pragma mark - Settings (defaults = user's requested values)
@@ -483,25 +482,53 @@ static BOOL WCPLReferJump(UIView *cell, id ref) {
     return NO;
 }
 
+// Scan every class in WeChat.app (frameworks included) instead of image 0 + name filter.
 static void WCPLHookReferTap(void) {
     SEL sel = @selector(handleTapForReferMsg:);
     unsigned n = 0;
-    const char **names = objc_copyClassNamesForImage(_dyld_get_image_name(0), &n);
+    Class *all = objc_copyClassList(&n);
     NSMutableString *hooked = [NSMutableString stringWithString:@"refer hooks:"];
+    NSMutableString *sels = [NSMutableString stringWithString:@"refer sels:"];
     for (unsigned i = 0; i < n; i++) {
-        if (!strstr(names[i], "Cell") && !strstr(names[i], "Refer")) continue;   // ponytail: name filter keeps the scan cheap
-        Class c = objc_getClass(names[i]);
-        Method m = class_getInstanceMethod(c, sel);
-        if (!m || m == class_getInstanceMethod(class_getSuperclass(c), sel)) continue;
-        IMP orig = method_getImplementation(m);
-        method_setImplementation(m, imp_implementationWithBlock(^(UIView *s, id ref) {
-            if (!WCPLReferJump(s, ref)) ((void (*)(id, SEL, id))orig)(s, sel, ref);
-        }));
-        [hooked appendFormat:@" %s", names[i]];
+        Class c = all[i];
+        const char *img = class_getImageName(c);
+        if (!img || !strstr(img, ".app/")) continue;
+        unsigned mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        for (unsigned j = 0; j < mc; j++) {
+            const char *s = sel_getName(method_getName(ms[j]));
+            if (strcasestr(s, "refer") && (strcasestr(s, "tap") || strcasestr(s, "click") || strcasestr(s, "jump")))
+                [sels appendFormat:@" %s.%s", class_getName(c), s];
+            if (method_getName(ms[j]) != sel) continue;
+            IMP orig = method_getImplementation(ms[j]);
+            method_setImplementation(ms[j], imp_implementationWithBlock(^(UIView *v, id ref) {
+                if (!WCPLReferJump(v, ref)) ((void (*)(id, SEL, id))orig)(v, sel, ref);
+            }));
+            [hooked appendFormat:@" %s", class_getName(c)];
+        }
+        free(ms);
     }
-    free(names);
+    free(all);
     WCPLLog(hooked);
+    WCPLLog(sels);
 }
+
+// Temporary: log the view chain + gesture targets under the first 30 taps, to find WeChat's real quote-tap action.
+%hook UIWindow
+- (void)sendEvent:(UIEvent *)e {
+    %orig;
+    static int left = 30;
+    UITouch *t = e.allTouches.anyObject;
+    if (left <= 0 || t.phase != UITouchPhaseEnded) return;
+    left--;
+    NSMutableString *s = [NSMutableString stringWithString:@"tap chain:"];
+    for (UIView *v = t.view; v && s.length < 3000; v = v.superview) {
+        [s appendFormat:@"\n  %@", v.class];
+        for (UIGestureRecognizer *g in v.gestureRecognizers) [s appendFormat:@"\n    %@", g];
+    }
+    WCPLLog(s);
+}
+%end
 
 #pragma mark - 3. 视频倍速手势 (0x9b2cc / 0x9b6dc / 0x9c884 / 0x116000)
 
