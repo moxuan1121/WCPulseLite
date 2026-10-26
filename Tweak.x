@@ -5,6 +5,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <mach-o/dyld.h>
 #import "WCPLSpeedMath.h"
 
 #pragma mark - Settings (defaults = user's requested values)
@@ -441,27 +442,66 @@ static void WCPLCellAction(id cell, SEL sel) {
     [vc presentViewController:sheet animated:YES completion:nil];
 }
 
-// 7b. 点击引用跳转 (WCPulse handleTapForReferMsg: 0x7378c0). The argument is the quoted CMessageWrap;
-// WCPulse scrolls the chat to it instead of WeChat's preview. Images (3) / videos (43, 62) keep the
-// native preview unless their own switch is on.
-- (void)handleTapForReferMsg:(id)ref {
-    BOOL jump = WCPLBool(@"WCPLReferJump") && [ref isKindOfClass:%c(CMessageWrap)];
-    unsigned type = jump ? [ref m_uiMessageType] : 0;
-    if (type == 3 && !WCPLBool(@"WCPLReferJumpImage")) jump = NO;
-    if ((type == 43 || type == 62) && !WCPLBool(@"WCPLReferJumpVideo")) jump = NO;
-    SEL scroll = @selector(scrollToMessage:highlight:marginTop:animated:);
-    id vc = nil;
-    if (jump && [self respondsToSelector:@selector(getViewController)]) vc = [self performSelector:@selector(getViewController)];
-    if (jump && ![vc respondsToSelector:scroll] && [self respondsToSelector:@selector(getCurrentViewController)])
-        vc = [self performSelector:@selector(getCurrentViewController)];
-    if (jump && ![vc respondsToSelector:scroll]) vc = WCPLOwnerVC(self);
-    if (![vc respondsToSelector:scroll]) {
-        %orig;
-        return;
-    }
-    ((void (*)(id, SEL, id, BOOL, double, BOOL))objc_msgSend)(vc, scroll, ref, YES, UIScreen.mainScreen.bounds.size.height / 3, YES);
-}
 %end
+
+#pragma mark - 7b. 点击引用跳转 (WCPulse handleTapForReferMsg: 0x7378c0)
+
+// The argument is the quoted CMessageWrap; WCPulse scrolls the chat to it instead of WeChat's preview.
+// Images (3) / videos (43, 62) keep the native preview unless their own switch is on.
+// WCPulse hooks only CommonMessageCellView, but a cell subclass that overrides the method bypasses that,
+// so every WeChat class owning handleTapForReferMsg: is hooked (each block keeps its own orig).
+// Diagnostics: Documents/WCPulseLite.log inside WeChat's container.
+static void WCPLLog(NSString *s) {
+    NSString *path = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"WCPulseLite.log"];
+    NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!h) { [NSData.data writeToFile:path atomically:NO]; h = [NSFileHandle fileHandleForWritingAtPath:path]; }
+    [h seekToEndOfFile];
+    [h writeData:[[NSString stringWithFormat:@"%@ %@\n", NSDate.date, s] dataUsingEncoding:NSUTF8StringEncoding]];
+    [h closeFile];
+}
+
+static BOOL WCPLReferJump(UIView *cell, id ref) {
+    if (!WCPLBool(@"WCPLReferJump") || ![ref isKindOfClass:%c(CMessageWrap)]) return NO;
+    unsigned type = [ref m_uiMessageType];
+    if (type == 3 && !WCPLBool(@"WCPLReferJumpImage")) return NO;
+    if ((type == 43 || type == 62) && !WCPLBool(@"WCPLReferJumpVideo")) return NO;
+    SEL scroll = @selector(scrollToMessage:highlight:marginTop:animated:);
+    NSMutableArray *cands = [NSMutableArray array];
+    if ([cell respondsToSelector:@selector(getViewController)]) [cands addObject:[cell performSelector:@selector(getViewController)] ?: NSNull.null];
+    if ([cell respondsToSelector:@selector(getCurrentViewController)]) [cands addObject:[cell performSelector:@selector(getCurrentViewController)] ?: NSNull.null];
+    for (UIResponder *r = cell; r; r = r.nextResponder) if ([r isKindOfClass:UIViewController.class]) [cands addObject:r];
+    NSMutableString *trace = [NSMutableString stringWithFormat:@"tap cell=%@ type=%u cands:", cell.class, type];
+    for (id vc in cands) {
+        BOOL ok = [vc respondsToSelector:scroll];
+        [trace appendFormat:@" %@=%d", [vc class], ok];
+        if (!ok) continue;
+        WCPLLog(trace);
+        ((void (*)(id, SEL, id, BOOL, double, BOOL))objc_msgSend)(vc, scroll, ref, YES, UIScreen.mainScreen.bounds.size.height / 3, YES);
+        return YES;
+    }
+    WCPLLog(trace);
+    return NO;
+}
+
+static void WCPLHookReferTap(void) {
+    SEL sel = @selector(handleTapForReferMsg:);
+    unsigned n = 0;
+    const char **names = objc_copyClassNamesForImage(_dyld_get_image_name(0), &n);
+    NSMutableString *hooked = [NSMutableString stringWithString:@"refer hooks:"];
+    for (unsigned i = 0; i < n; i++) {
+        if (!strstr(names[i], "Cell") && !strstr(names[i], "Refer")) continue;   // ponytail: name filter keeps the scan cheap
+        Class c = objc_getClass(names[i]);
+        Method m = class_getInstanceMethod(c, sel);
+        if (!m || m == class_getInstanceMethod(class_getSuperclass(c), sel)) continue;
+        IMP orig = method_getImplementation(m);
+        method_setImplementation(m, imp_implementationWithBlock(^(UIView *s, id ref) {
+            if (!WCPLReferJump(s, ref)) ((void (*)(id, SEL, id))orig)(s, sel, ref);
+        }));
+        [hooked appendFormat:@" %s", names[i]];
+    }
+    free(names);
+    WCPLLog(hooked);
+}
 
 #pragma mark - 3. 视频倍速手势 (0x9b2cc / 0x9b6dc / 0x9c884 / 0x116000)
 
@@ -815,3 +855,8 @@ static void WCPLVoiceRestoreGestures(MMTextView *tv) {
     %orig;
 }
 %end
+
+%ctor {
+    %init;
+    WCPLHookReferTap();
+}
