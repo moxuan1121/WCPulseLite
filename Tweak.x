@@ -468,7 +468,7 @@ static BOOL WCPLReferJump(UIView *cell, id ref) {
 
 %hook TextMessageCellView
 - (void)handleTapForReferMsg:(id)ref {
-    if (!WCPLReferJump(self, ref)) %orig;
+    if (!WCPLReferJump((UIView *)self, ref)) %orig;
 }
 %end
 
