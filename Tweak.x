@@ -631,7 +631,7 @@ static NSString *WCPLAtRoomKey(NSString *room) { return [@"WCPLAtDismissed_" str
 - (void)updateToolViewHeight:(CGFloat)h {
     %orig;
     if (!WCPLBool(@"WCPLGroupAtTips")) return;
-    UIViewController *vc = WCPLOwnerVC(self);
+    UIViewController *vc = WCPLOwnerVC((UIView *)self);
     if ([vc respondsToSelector:@selector(wcpl_positionAtTips)]) [vc performSelector:@selector(wcpl_positionAtTips)];
 }
 %end
