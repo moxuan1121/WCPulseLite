@@ -34,6 +34,9 @@ static NSUserDefaults *WCPLDefaults(void) {
             @"WCPLReferJump": @YES,                   // 点击引用跳转到原消息
             @"WCPLReferJumpImage": @NO,               // 引用的是图片时也跳转（关=原生打开图片）
             @"WCPLReferJumpVideo": @NO,               // 引用的是视频时也跳转（关=原生播放）
+            @"WCPLGroupAtTips": @YES,                 // 群聊艾特提示（有人@你 悬浮条）
+            @"WCPLGroupAtTipsSort": @YES,             // 悬浮条点击跳到最新一条@（关=最早一条）
+            @"WCPLGroupAtTipsFilterVisible": @YES,    // 屏幕上已看到的@不再提示
         }];
     });
     return d;
@@ -221,6 +224,9 @@ static NSArray<NSArray *> *WCPLRows(void) {
         @[@"引用", @[@"S", @"点击引用跳转到原消息", @"WCPLReferJump"],
                   @[@"S", @"↳ 引用图片也跳转", @"WCPLReferJumpImage"],
                   @[@"S", @"↳ 引用视频也跳转", @"WCPLReferJumpVideo"]],
+        @[@"群聊艾特", @[@"S", @"启用群聊艾特提示", @"WCPLGroupAtTips"],
+                     @[@"S", @"↳ 跳到最新一条@（关=最早）", @"WCPLGroupAtTipsSort"],
+                     @[@"S", @"↳ 已看到的@不再提示", @"WCPLGroupAtTipsFilterVisible"]],
         @[@"输入框", @[@"S", @"空输入框长按语音", @"WCPLEmptyInputVoice"]],
         @[@"消息直达", @[@"S", @"开启前台直达", @"WCPLPushFG"],
                     @[@"M", @"↳ 前台直达模式", @"WCPLPushFGMode"],
@@ -469,6 +475,164 @@ static BOOL WCPLReferJump(UIView *cell, id ref) {
 %hook TextMessageCellView
 - (void)handleTapForReferMsg:(id)ref {
     if (!WCPLReferJump((UIView *)self, ref)) %orig;
+}
+%end
+
+#pragma mark - 7c. 群聊艾特提示 (WCPulse viewDidAppear scan 0xadc78 / 0x11fb98, @-detect 0x69748, edge view 0xae674)
+
+// Entering a group chat: scan recent messages for ones whose m_nsAtUserList (","-joined) contains my
+// wxid or "notify@all", then float an MMEdgeTipsView "有人@你(N)". Tap -> scrollToMessage; swipe/long-press -> dismiss.
+// Per-room dismissed state is kept in WCPLDefaults so a dismissed tip doesn't re-show on re-entry.
+// ponytail: scans only the already-loaded GetMessagesWrapArray (recent page), not WeChat's full history
+// via GetDownMsg:FromID:Limit:LeftCount: like the original's paged WCPulseMentionScanner. Covers @ in
+// recent unread; add paged scan if someone needs @ far above the loaded window.
+
+@interface MMEdgeTipsView : UIView
+- (instancetype)initWithTitle:(NSString *)title image:(UIImage *)image;
+- (void)showAnimate:(BOOL)a parentView:(UIView *)p finishBlock:(id)b;
+- (void)hideAnimate:(BOOL)a parentView:(UIView *)p finishBlock:(id)b;
+@end
+@interface CMessageWrap (WCPLAt)
+@property (nonatomic, readonly) unsigned int m_uiMesLocalID;
+@property (nonatomic, copy, readonly) NSString *m_nsAtUserList;
+@end
+
+static char kWCPLAtTipsView, kWCPLAtTarget;
+static const NSInteger kWCPLAtTag = 0x91d;
+
+// myWxid: WeChat stores the logged-in user under SettingUtil (same source the swipe feature uses).
+static NSString *WCPLMyWxid(void) {
+    NSString *me = [%c(SettingUtil) performSelector:@selector(getLocalUsrName:) withObject:nil];
+    return me.length ? me : nil;
+}
+
+static BOOL WCPLMsgAtsMe(CMessageWrap *msg, NSString *me) {
+    NSString *list = [msg respondsToSelector:@selector(m_nsAtUserList)] ? msg.m_nsAtUserList : nil;
+    if (![list isKindOfClass:NSString.class] || !list.length) return NO;
+    NSArray *ats = [list componentsSeparatedByString:@","];
+    return (me && [ats containsObject:me]) || [ats containsObject:@"notify@all"];
+}
+
+// Per-room key under which we remember the last-dismissed @ localID.
+static NSString *WCPLAtRoomKey(NSString *room) { return [@"WCPLAtDismissed_" stringByAppendingString:room ?: @""]; }
+
+@interface BaseMsgContentViewController (WCPLAt)
+- (id)getChatContact;
+- (NSArray *)GetMessagesWrapArray;
+- (void)wcpl_showAtTips;
+- (void)wcpl_dismissAtTips:(id)sender;
+- (void)wcpl_tapAtTips:(id)sender;
+- (void)wcpl_positionAtTips;
+@end
+
+%hook BaseMsgContentViewController
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    if (!WCPLBool(@"WCPLGroupAtTips")) return;
+    // Let the message list settle (WeChat loads unread on appear), then scan once.
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (weakSelf.viewIfLoaded.window) [weakSelf wcpl_showAtTips];
+    });
+}
+
+%new
+- (void)wcpl_showAtTips {
+    id contact = [self respondsToSelector:@selector(getChatContact)] ? [self getChatContact] : nil;
+    NSString *room = [contact respondsToSelector:@selector(m_nsUsrName)] ? [contact performSelector:@selector(m_nsUsrName)] : nil;
+    if (![room hasSuffix:@"@chatroom"]) return;                       // group chats only
+    if (![self respondsToSelector:@selector(GetMessagesWrapArray)]) return;
+
+    NSString *me = WCPLMyWxid();
+    NSArray *msgs = [self GetMessagesWrapArray];
+    BOOL filterVisible = WCPLBool(@"WCPLGroupAtTipsFilterVisible");
+    // ponytail: "visible" = last 10 loaded rows, same heuristic the original uses for the on-screen set.
+    NSUInteger visibleFrom = msgs.count > 10 ? msgs.count - 10 : 0;
+
+    NSMutableArray<CMessageWrap *> *matches = [NSMutableArray array];
+    NSNumber *dismissed = [WCPLDefaults() objectForKey:WCPLAtRoomKey(room)];
+    for (NSUInteger i = 0; i < msgs.count; i++) {
+        CMessageWrap *m = msgs[i];
+        if (![m isKindOfClass:%c(CMessageWrap)] || !WCPLMsgAtsMe(m, me)) continue;
+        if (filterVisible && i >= visibleFrom) continue;             // already on screen
+        if (dismissed && m.m_uiMesLocalID <= dismissed.unsignedIntValue) continue; // user dismissed up to here
+        [matches addObject:m];
+    }
+    if (!matches.count) { [self wcpl_dismissAtTips:nil]; return; }
+
+    // Jump target: newest match (sort on) or oldest (sort off).
+    CMessageWrap *target = WCPLBool(@"WCPLGroupAtTipsSort") ? matches.lastObject : matches.firstObject;
+    objc_setAssociatedObject(self, &kWCPLAtTarget, target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    MMEdgeTipsView *tips = objc_getAssociatedObject(self, &kWCPLAtTipsView);
+    if (tips) [tips hideAnimate:NO parentView:self.view finishBlock:nil];
+    NSString *title = [NSString stringWithFormat:@"有人@你(%lu)", (unsigned long)matches.count];
+    UIImage *arrow = [UIImage systemImageNamed:@"chevron.up"] ?: nil;
+    tips = [[%c(MMEdgeTipsView) alloc] initWithTitle:title image:arrow];
+    tips.tag = kWCPLAtTag;
+    [tips addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(wcpl_tapAtTips:)]];
+    UISwipeGestureRecognizer *sw = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(wcpl_dismissAtTips:)];
+    sw.direction = UISwipeGestureRecognizerDirectionLeft;
+    [tips addGestureRecognizer:sw];
+    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(wcpl_dismissAtTips:)];
+    lp.minimumPressDuration = 0.5;
+    [tips addGestureRecognizer:lp];
+    objc_setAssociatedObject(self, &kWCPLAtTipsView, tips, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [self wcpl_positionAtTips];
+    [tips showAnimate:YES parentView:self.view finishBlock:nil];
+}
+
+%new
+- (void)wcpl_tapAtTips:(id)sender {
+    CMessageWrap *target = objc_getAssociatedObject(self, &kWCPLAtTarget);
+    if (target && [self respondsToSelector:@selector(scrollToMessage:highlight:marginTop:animated:)])
+        ((void (*)(id, SEL, id, BOOL, double, BOOL))objc_msgSend)(self,
+            @selector(scrollToMessage:highlight:marginTop:animated:), target, YES,
+            UIScreen.mainScreen.bounds.size.height / 3, YES);
+    [self wcpl_dismissAtTips:sender];
+}
+
+%new
+- (void)wcpl_dismissAtTips:(id)sender {
+    MMEdgeTipsView *tips = objc_getAssociatedObject(self, &kWCPLAtTipsView);
+    if (!tips) return;
+    // Remember how far the user has dismissed so re-entry doesn't re-show the same @.
+    CMessageWrap *target = objc_getAssociatedObject(self, &kWCPLAtTarget);
+    id contact = [self respondsToSelector:@selector(getChatContact)] ? [self getChatContact] : nil;
+    NSString *room = [contact respondsToSelector:@selector(m_nsUsrName)] ? [contact performSelector:@selector(m_nsUsrName)] : nil;
+    if (sender && target && room.length)   // nil sender = programmatic clear, don't persist
+        [WCPLDefaults() setObject:@(target.m_uiMesLocalID) forKey:WCPLAtRoomKey(room)];
+    [tips hideAnimate:(sender != nil) parentView:self.view finishBlock:nil];
+    objc_setAssociatedObject(self, &kWCPLAtTipsView, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(self, &kWCPLAtTarget, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+%new
+- (void)wcpl_positionAtTips {
+    MMEdgeTipsView *tips = objc_getAssociatedObject(self, &kWCPLAtTipsView);
+    if (!tips || tips.superview != self.view) {
+        if (tips && !tips.superview) [self.view addSubview:tips];
+        else if (!tips) return;
+    }
+    [tips sizeToFit];
+    CGSize sz = tips.bounds.size;
+    if (sz.width < 1) sz = CGSizeMake(130, 36);
+    CGFloat right = self.view.bounds.size.width - sz.width - 12;
+    // Sit just above the input toolbar; fall back to a safe-area offset.
+    CGFloat bottom = self.view.bounds.size.height - self.view.safeAreaInsets.bottom - 56 - sz.height;
+    tips.frame = CGRectMake(right, bottom, sz.width, sz.height);
+}
+
+%end
+
+// Keyboard / toolbar height changes -> keep the pill above the input bar.
+%hook MMInputToolView
+- (void)updateToolViewHeight:(CGFloat)h {
+    %orig;
+    if (!WCPLBool(@"WCPLGroupAtTips")) return;
+    UIViewController *vc = WCPLOwnerVC(self);
+    if ([vc respondsToSelector:@selector(wcpl_positionAtTips)]) [vc performSelector:@selector(wcpl_positionAtTips)];
 }
 %end
 
