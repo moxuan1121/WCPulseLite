@@ -37,6 +37,7 @@ static NSUserDefaults *WCPLDefaults(void) {
             @"WCPLGroupAtTips": @YES,                 // 群聊艾特提示（有人@你 悬浮条）
             @"WCPLGroupAtTipsSort": @YES,             // 悬浮条点击跳到最新一条@（关=最早一条）
             @"WCPLGroupAtTipsFilterVisible": @YES,    // 屏幕上已看到的@不再提示
+            @"WCPLSwipeProbe": @NO,                   // 调试：左滑时弹出层级/坐标并复制到剪贴板
         }];
     });
     return d;
@@ -170,13 +171,104 @@ static CGRect WCPLClampPull(UIView *pull, CGRect f) {
     return f;
 }
 
+// ---- 左滑诊断 (WCPLSwipeProbe): dump real hierarchy/frames to screen + pasteboard ----
+static unsigned long gProbePullLayout, gProbePullFrame, gProbeClamp, gProbeTouch, gProbeTableLayout;
+
+static NSString *WCPLR(CGRect r) { return [NSString stringWithFormat:@"(%.0f,%.0f %.0fx%.0f)", r.origin.x, r.origin.y, r.size.width, r.size.height]; }
+static CGRect WCPLWin(UIView *v) { return [v convertRect:v.bounds toView:nil]; }
+
+static void WCPLFindSwipe(UIView *v, NSMutableArray *out, int depth) {
+    if (out.count >= 4 || depth > 12) return;
+    NSString *n = NSStringFromClass(v.class);
+    if ([n containsString:@"Swipe"] || [n containsString:@"PullView"]) { [out addObject:v]; return; }
+    for (UIView *s in v.subviews) WCPLFindSwipe(s, out, depth + 1);
+}
+
+static void WCPLProbeDump(void) {
+    UIWindow *win = UIApplication.sharedApplication.keyWindow;
+    if (!win) return;
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"WCPL %@ iOS %@ WX %@\n", @"0.1.9", UIDevice.currentDevice.systemVersion,
+        NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"]];
+    [s appendFormat:@"cnt pullLay=%lu pullFrm=%lu clamp=%lu touch=%lu tblLay=%lu\n",
+        gProbePullLayout, gProbePullFrame, gProbeClamp, gProbeTouch, gProbeTableLayout];
+    NSMutableArray *sw = [NSMutableArray array];
+    WCPLFindSwipe(win, sw, 0);
+    UITableView *t = nil;
+    for (UIView *v in sw) {
+        [s appendFormat:@"\n[S] %@ %@ clip=%d\n", NSStringFromClass(v.class), WCPLR(WCPLWin(v)), v.clipsToBounds];
+        for (UIView *a = v.superview; a && a != win; a = a.superview) {
+            [s appendFormat:@"  ^ %@ %@ clip=%d\n", NSStringFromClass(a.class), WCPLR(WCPLWin(a)), a.clipsToBounds];
+            if (!t && [a isKindOfClass:UITableView.class]) { t = (UITableView *)a; break; }
+        }
+        for (UIView *c in v.subviews) {
+            [s appendFormat:@"  - %@ %@\n", NSStringFromClass(c.class), WCPLR(WCPLWin(c))];
+            for (UIView *g in c.subviews) [s appendFormat:@"    - %@ %@\n", NSStringFromClass(g.class), WCPLR(WCPLWin(g))];
+        }
+    }
+    if (!t) {   // no swipe view found: still report the home table
+        NSMutableArray *st = [NSMutableArray arrayWithObject:win];
+        while (st.count && !t) {
+            UIView *v = st.lastObject; [st removeLastObject];
+            if ([v isKindOfClass:%c(MainFrameTableView)]) t = (UITableView *)v; else [st addObjectsFromArray:v.subviews];
+        }
+    }
+    if (t) {
+        [s appendFormat:@"\n[T] %@ isMF=%d style=%ld win%@ bounds%@\n margins L%.0f R%.0f inset T%.0f B%.0f\n",
+            NSStringFromClass(t.class), [t isKindOfClass:%c(MainFrameTableView)], (long)t.style, WCPLR(WCPLWin(t)),
+            WCPLR(t.bounds), t.layoutMargins.left, t.layoutMargins.right, t.contentInset.top, t.contentInset.bottom];
+        [s appendFormat:@" cardMaxX(table)=%.0f\n", WCPLCardMaxX(t, t)];
+        int i = 0;
+        for (UITableViewCell *c in t.visibleCells) {
+            if (i++ >= 6) break;
+            [s appendFormat:@"[C%d] %@ frm%@ win%@ sup=%@\n", i, NSStringFromClass(c.class), WCPLR(c.frame), WCPLR(WCPLWin(c)),
+                NSStringFromClass(c.superview.class)];
+            int j = 0;
+            for (UIView *v in c.subviews) {
+                if (j++ >= 6) break;
+                [s appendFormat:@"   - %@ %@\n", NSStringFromClass(v.class), WCPLR(WCPLWin(v))];
+            }
+        }
+        [s appendString:@"[T.subviews]\n"];
+        int k = 0;
+        for (UIView *v in t.subviews) {
+            if (k++ >= 14) break;
+            [s appendFormat:@" %@ %@\n", NSStringFromClass(v.class), WCPLR(WCPLWin(v))];
+        }
+    }
+    UIPasteboard.generalPasteboard.string = s;
+    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectInset(win.bounds, 8, 90)];
+    tv.editable = NO;
+    tv.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
+    tv.textColor = UIColor.whiteColor;
+    tv.backgroundColor = [UIColor colorWithWhite:0 alpha:0.85];
+    tv.text = [@"已复制到剪贴板，点此关闭\n" stringByAppendingString:s];
+    [tv addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:tv action:@selector(removeFromSuperview)]];
+    [win addSubview:tv];
+}
+
+// Called from several hooks so we learn which ones fire; dumps 0.6s later once the swipe settles.
+static void WCPLProbeKick(void) {
+    if (!WCPLBool(@"WCPLSwipeProbe")) return;
+    static CFTimeInterval last;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - last < 4) return;
+    last = now;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ WCPLProbeDump(); });
+}
+
 %hook UISwipeActionPullView
 - (void)setFrame:(CGRect)f {
-    %orig(WCPLClampPull(self, f));
+    gProbePullFrame++;
+    CGRect c = WCPLClampPull(self, f);
+    if (!CGRectEqualToRect(c, f)) gProbeClamp++;
+    %orig(c);
 }
 // Catches frames set before insertion or via bounds/center; the clamped setFrame: won't loop.
 - (void)layoutSubviews {
     %orig;
+    gProbePullLayout++;
+    WCPLProbeKick();
     if (!WCPLHomeTable(self)) return;
     self.clipsToBounds = YES;   // buttons stretched for over-swipe must not paint past the card either
     CGRect f = WCPLClampPull(self, self.frame);
@@ -186,7 +278,17 @@ static CGRect WCPLClampPull(UIView *pull, CGRect f) {
 
 // Touch -> row: use the cell actually drawn under the finger; fall back to UIKit's row math elsewhere.
 %hook MainFrameTableView
+- (void)layoutSubviews {
+    %orig;
+    gProbeTableLayout++;
+    if (!WCPLBool(@"WCPLSwipeProbe")) return;
+    NSMutableArray *sw = [NSMutableArray array];
+    WCPLFindSwipe(self, sw, 0);
+    if (sw.count) WCPLProbeKick();
+}
 - (id)swipeActionController:(id)controller indexPathForTouchLocation:(CGPoint)p {
+    gProbeTouch++;
+    WCPLProbeKick();
     id ip = %orig;
     if (!WCPLBool(@"WCPLHomeCorner")) return ip;
     UITableView *t = (UITableView *)self;
@@ -272,7 +374,8 @@ static NSArray<NSArray *> *WCPLRows(void) {
         @[@"首页圆角（重启微信生效）", @[@"S", @"启用首页圆角", @"WCPLHomeCorner"],
                                      @[@"T", @"↳ 上下间距", @"WCPLHomeCornerVPadding"],
                                      @[@"T", @"↳ 背景颜色", @"WCPLHomeCornerLight"],
-                                     @[@"T", @"↳ 深色背景颜色", @"WCPLHomeCornerDark"]],
+                                     @[@"T", @"↳ 深色背景颜色", @"WCPLHomeCornerDark"],
+                                     @[@"S", @"↳ 左滑诊断(调试)", @"WCPLSwipeProbe"]],
         @[@"视频", @[@"S", @"启用视频倍速手势", @"WCPLVideoSpeed"],
                   @[@"T", @"↳ 左侧倍速", @"WCPLLeftSpeed"],
                   @[@"T", @"↳ 右侧倍速", @"WCPLRightSpeed"]],
