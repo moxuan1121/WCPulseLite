@@ -141,40 +141,53 @@ static void WCPLClearBG(id view) {
 
 #pragma mark - 2b. 左滑几何探针（调试，WCPLSwipeProbe）
 
-// Dumps the swipe-action container frame vs. the matching cell frame when you swipe a home-list row,
-// so we can see the exact Y offset and class names without Filza. Legacy swipe hierarchy (iOS13-16):
-// UITableView -> _UITableViewCellSwipeContainerView -> UISwipeActionPullView -> UISwipeActionStandardButton.
-// Hooking the container's setFrame: catches the exact moment UIKit positions it.
-@interface _UITableViewCellSwipeContainerView : UIView @end
-%hook _UITableViewCellSwipeContainerView
-- (void)setFrame:(CGRect)frame {
+// Class-agnostic: don't guess the swipe container class. On every MainFrameTableView layout, scan the
+// table's own subviews for any whose class name contains Swipe/Pull/Action and dump its frame vs. the
+// nearest cell. This catches whatever UIKit/WeChat actually uses on this build.
+%hook MainFrameTableView
+- (void)layoutSubviews {
     %orig;
     if (!WCPLBool(@"WCPLSwipeProbe")) return;
-    // Container may sit directly under the table or under a wrapper; walk up to the UITableView.
-    UIView *sup = self.superview;
-    UITableView *table = nil;
-    for (UIView *v = sup; v; v = v.superview) if ([v isKindOfClass:UITableView.class]) { table = (UITableView *)v; break; }
-    if (!table) return;
-    // Nearest visible cell by vertical center.
+    UITableView *table = (UITableView *)self;
+    UIView *swipe = nil;
+    for (UIView *v in table.subviews) {
+        NSString *n = NSStringFromClass(v.class);
+        if ([n containsString:@"Swipe"] || [n containsString:@"Pull"] || [n containsString:@"Action"]) { swipe = v; break; }
+    }
+    NSString *where = @"table.subview";
+    if (!swipe) {
+        // Fallback: search the whole key window tree so we learn the class + its host even if the swipe
+        // view isn't a direct table subview on this build.
+        UIWindow *w = UIApplication.sharedApplication.keyWindow;
+        NSMutableArray<UIView *> *stack = w ? [NSMutableArray arrayWithObject:w] : [NSMutableArray array];
+        while (stack.count) {
+            UIView *v = stack.lastObject; [stack removeLastObject];
+            NSString *n = NSStringFromClass(v.class);
+            if (v != w && ([n containsString:@"Swipe"] || [n containsString:@"Pull"])) {
+                swipe = v; where = [@"win>" stringByAppendingString:NSStringFromClass(v.superview.class)]; break;
+            }
+            [stack addObjectsFromArray:v.subviews];
+        }
+    }
+    if (!swipe) return;                               // no swipe view present right now
+    static CFTimeInterval lastShow; CFTimeInterval now = CACurrentMediaTime();
+    if (now - lastShow < 0.8) return;                 // throttle: one dump per swipe
+    lastShow = now;
     UITableViewCell *near = nil; CGFloat best = CGFLOAT_MAX;
     for (UITableViewCell *c in table.visibleCells) {
-        CGFloat d = fabs(CGRectGetMidY(c.frame) - CGRectGetMidY(frame));
+        CGFloat d = fabs(CGRectGetMidY(c.frame) - CGRectGetMidY(swipe.frame));
         if (d < best) { best = d; near = c; }
     }
-    static CFTimeInterval lastShow; CFTimeInterval now = CACurrentMediaTime();
-    if (now - lastShow < 0.8) return;                // throttle: one dump per swipe
-    lastShow = now;
     NSString *msg = [NSString stringWithFormat:
-        @"container=%@\n superview=%@\n frame.y=%.1f h=%.1f\ncell=%@\n frame.y=%.1f h=%.1f\nΔy(container-cell)=%.1f\ntable.contentInset.top=%.1f",
-        NSStringFromClass(self.class), NSStringFromClass(sup.class), frame.origin.y, frame.size.height,
+        @"swipe=%@ @%@\n frame.y=%.1f h=%.1f\ncell=%@\n frame.y=%.1f h=%.1f\nΔy(swipe-cell)=%.1f\ninset.top=%.1f  offset.y=%.1f",
+        NSStringFromClass(swipe.class), where, swipe.frame.origin.y, swipe.frame.size.height,
         near ? NSStringFromClass(near.class) : @"(none)",
         near.frame.origin.y, near.frame.size.height,
-        frame.origin.y - near.frame.origin.y,
-        table.contentInset.top];
-    // Non-blocking banner on the key window (an alert would eat the swipe).
+        swipe.frame.origin.y - near.frame.origin.y,
+        table.contentInset.top, table.contentOffset.y];
     UIWindow *win = UIApplication.sharedApplication.keyWindow;
     if (!win) return;
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(8, 60, win.bounds.size.width - 16, 150)];
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(8, 60, win.bounds.size.width - 16, 160)];
     l.numberOfLines = 0;
     l.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
     l.textColor = UIColor.whiteColor;
