@@ -37,7 +37,6 @@ static NSUserDefaults *WCPLDefaults(void) {
             @"WCPLGroupAtTips": @YES,                 // 群聊艾特提示（有人@你 悬浮条）
             @"WCPLGroupAtTipsSort": @YES,             // 悬浮条点击跳到最新一条@（关=最早一条）
             @"WCPLGroupAtTipsFilterVisible": @YES,    // 屏幕上已看到的@不再提示
-            @"WCPLSwipeProbe": @NO,                   // 调试：左滑时弹出容器/cell 几何探针
         }];
     });
     return d;
@@ -139,65 +138,6 @@ static void WCPLClearBG(id view) {
 }
 %end
 
-#pragma mark - 2b. 左滑几何探针（调试，WCPLSwipeProbe）
-
-// Class-agnostic: don't guess the swipe container class. On every MainFrameTableView layout, scan the
-// table's own subviews for any whose class name contains Swipe/Pull/Action and dump its frame vs. the
-// nearest cell. This catches whatever UIKit/WeChat actually uses on this build.
-%hook MainFrameTableView
-- (void)layoutSubviews {
-    %orig;
-    if (!WCPLBool(@"WCPLSwipeProbe")) return;
-    UITableView *table = (UITableView *)self;
-    UIView *swipe = nil;
-    for (UIView *v in table.subviews) {
-        NSString *n = NSStringFromClass(v.class);
-        if ([n containsString:@"Swipe"] || [n containsString:@"Pull"] || [n containsString:@"Action"]) { swipe = v; break; }
-    }
-    NSString *where = @"table.subview";
-    if (!swipe) {
-        // Fallback: search the whole key window tree so we learn the class + its host even if the swipe
-        // view isn't a direct table subview on this build.
-        UIWindow *w = UIApplication.sharedApplication.keyWindow;
-        NSMutableArray<UIView *> *stack = w ? [NSMutableArray arrayWithObject:w] : [NSMutableArray array];
-        while (stack.count) {
-            UIView *v = stack.lastObject; [stack removeLastObject];
-            NSString *n = NSStringFromClass(v.class);
-            if (v != w && ([n containsString:@"Swipe"] || [n containsString:@"Pull"])) {
-                swipe = v; where = [@"win>" stringByAppendingString:NSStringFromClass(v.superview.class)]; break;
-            }
-            [stack addObjectsFromArray:v.subviews];
-        }
-    }
-    if (!swipe) return;                               // no swipe view present right now
-    static CFTimeInterval lastShow; CFTimeInterval now = CACurrentMediaTime();
-    if (now - lastShow < 0.8) return;                 // throttle: one dump per swipe
-    lastShow = now;
-    UITableViewCell *near = nil; CGFloat best = CGFLOAT_MAX;
-    for (UITableViewCell *c in table.visibleCells) {
-        CGFloat d = fabs(CGRectGetMidY(c.frame) - CGRectGetMidY(swipe.frame));
-        if (d < best) { best = d; near = c; }
-    }
-    NSString *msg = [NSString stringWithFormat:
-        @"swipe=%@ @%@\n frame.y=%.1f h=%.1f\ncell=%@\n frame.y=%.1f h=%.1f\nΔy(swipe-cell)=%.1f\ninset.top=%.1f  offset.y=%.1f",
-        NSStringFromClass(swipe.class), where, swipe.frame.origin.y, swipe.frame.size.height,
-        near ? NSStringFromClass(near.class) : @"(none)",
-        near.frame.origin.y, near.frame.size.height,
-        swipe.frame.origin.y - near.frame.origin.y,
-        table.contentInset.top, table.contentOffset.y];
-    UIWindow *win = UIApplication.sharedApplication.keyWindow;
-    if (!win) return;
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(8, 60, win.bounds.size.width - 16, 160)];
-    l.numberOfLines = 0;
-    l.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
-    l.textColor = UIColor.whiteColor;
-    l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.8];
-    l.text = msg;
-    [win addSubview:l];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [l removeFromSuperview]; });
-}
-%end
-
 #pragma mark - 4. 消息直达 (WCPush2Chat 0x4bbc / 0x4e28 / 0x5530 / 0x5974)
 
 // Tapping a message notification opens that chat directly (full-screen push or half-screen sheet).
@@ -274,8 +214,7 @@ static NSArray<NSArray *> *WCPLRows(void) {
         @[@"首页圆角（重启微信生效）", @[@"S", @"启用首页圆角", @"WCPLHomeCorner"],
                                      @[@"T", @"↳ 上下间距", @"WCPLHomeCornerVPadding"],
                                      @[@"T", @"↳ 背景颜色", @"WCPLHomeCornerLight"],
-                                     @[@"T", @"↳ 深色背景颜色", @"WCPLHomeCornerDark"],
-                                     @[@"S", @"↳ 左滑几何探针(调试)", @"WCPLSwipeProbe"]],
+                                     @[@"T", @"↳ 深色背景颜色", @"WCPLHomeCornerDark"]],
         @[@"视频", @[@"S", @"启用视频倍速手势", @"WCPLVideoSpeed"],
                   @[@"T", @"↳ 左侧倍速", @"WCPLLeftSpeed"],
                   @[@"T", @"↳ 右侧倍速", @"WCPLRightSpeed"]],
