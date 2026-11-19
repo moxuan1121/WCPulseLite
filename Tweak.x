@@ -111,7 +111,8 @@ static CGFloat WCPLPad(void) { return [WCPLDefaults() doubleForKey:@"WCPLHomeCor
 // UIKit toggles clipping per row for the rounded corners (on for first/last, off for middle); keep it on.
 - (void)setClipsToBounds:(BOOL)clip {
     UIView *cell = (UIView *)self;
-    %orig(clip || (WCPLBool(@"WCPLHomeCorner") && [cell.superview.superview isKindOfClass:%c(MainFrameTableView)]));
+    BOOL home = WCPLBool(@"WCPLHomeCorner") && [cell.superview.superview isKindOfClass:%c(MainFrameTableView)];
+    %orig(clip || home);
 }
 %end
 
