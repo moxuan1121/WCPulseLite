@@ -138,6 +138,64 @@ static void WCPLClearBG(id view) {
 }
 %end
 
+#pragma mark - 2b. 圆角左滑菜单对齐
+
+// With the inset card, UIKit still sizes the swipe-action bar (UISwipeActionPullView) out to the
+// table's edge, ~20pt past the card. First/last rows hide it under their rounded-corner clip; middle
+// rows show the overhang, and while a row closes its overhang lingers in the margin where the next
+// left swipe starts, so that swipe grabs the wrong row. Clamp the bar to the card's right edge.
+@interface UISwipeActionPullView : UIView @end
+
+static UITableView *WCPLHomeTable(UIView *v) {
+    if (!WCPLBool(@"WCPLHomeCorner")) return nil;
+    for (UIView *s = v.superview; s; s = s.superview)
+        if ([s isKindOfClass:%c(MainFrameTableView)]) return (UITableView *)s;
+    return nil;
+}
+
+// Card right edge in `space` coords. The swiped cell slides left, so the max over visible cells is the
+// resting card edge. CGFLOAT_MAX = cells aren't inset, nothing to clamp.
+static CGFloat WCPLCardMaxX(UITableView *t, UIView *space) {
+    CGFloat maxX = 0;
+    for (UITableViewCell *c in t.visibleCells) maxX = MAX(maxX, CGRectGetMaxX([c convertRect:c.bounds toView:t]));
+    if (maxX <= 0 || maxX >= CGRectGetMaxX(t.bounds) - 0.5) return CGFLOAT_MAX;
+    return [t convertPoint:CGPointMake(maxX, 0) toView:space].x;
+}
+
+static CGRect WCPLClampPull(UIView *pull, CGRect f) {
+    UITableView *t = WCPLHomeTable(pull);
+    if (!t || !pull.superview) return f;
+    CGFloat edge = WCPLCardMaxX(t, pull.superview);
+    if (CGRectGetMaxX(f) > edge + 0.5 && edge > CGRectGetMinX(f)) f.size.width = edge - CGRectGetMinX(f);
+    return f;
+}
+
+%hook UISwipeActionPullView
+- (void)setFrame:(CGRect)f {
+    %orig(WCPLClampPull(self, f));
+}
+// Catches frames set before insertion or via bounds/center; the clamped setFrame: won't loop.
+- (void)layoutSubviews {
+    %orig;
+    if (!WCPLHomeTable(self)) return;
+    self.clipsToBounds = YES;   // buttons stretched for over-swipe must not paint past the card either
+    CGRect f = WCPLClampPull(self, self.frame);
+    if (!CGRectEqualToRect(f, self.frame)) self.frame = f;
+}
+%end
+
+// Touch -> row: use the cell actually drawn under the finger; fall back to UIKit's row math elsewhere.
+%hook MainFrameTableView
+- (id)swipeActionController:(id)controller indexPathForTouchLocation:(CGPoint)p {
+    id ip = %orig;
+    if (!WCPLBool(@"WCPLHomeCorner")) return ip;
+    UITableView *t = (UITableView *)self;
+    for (UITableViewCell *c in t.visibleCells)
+        if (CGRectContainsPoint([c convertRect:c.bounds toView:t], p)) return [t indexPathForCell:c] ?: ip;
+    return ip;
+}
+%end
+
 #pragma mark - 4. 消息直达 (WCPush2Chat 0x4bbc / 0x4e28 / 0x5530 / 0x5974)
 
 // Tapping a message notification opens that chat directly (full-screen push or half-screen sheet).
