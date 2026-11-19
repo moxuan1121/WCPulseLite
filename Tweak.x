@@ -37,7 +37,6 @@ static NSUserDefaults *WCPLDefaults(void) {
             @"WCPLGroupAtTips": @YES,                 // 群聊艾特提示（有人@你 悬浮条）
             @"WCPLGroupAtTipsSort": @YES,             // 悬浮条点击跳到最新一条@（关=最早一条）
             @"WCPLGroupAtTipsFilterVisible": @YES,    // 屏幕上已看到的@不再提示
-            @"WCPLSwipeProbe": @NO,                   // 调试：左滑时弹出层级/坐标并复制到剪贴板
         }];
     });
     return d;
@@ -154,86 +153,6 @@ static void WCPLClearBG(id view) {
 // First/last rows get clipped by UIKit's rounded-corner mask and look right; middle rows had no clip.
 // So clip every home row to its own bounds (see the MMTableViewCell hook above).
 
-// ---- 左滑诊断 (WCPLSwipeProbe): dump real hierarchy/frames/gestures to screen + pasteboard ----
-static CGPoint gProbeHitWin;            // last touch-down point the home table saw (window coords)
-static CFTimeInterval gProbeHitTime;
-
-static NSString *WCPLR(CGRect r) { return [NSString stringWithFormat:@"(%.0f,%.0f %.0fx%.0f)", r.origin.x, r.origin.y, r.size.width, r.size.height]; }
-static CGRect WCPLWin(UIView *v) { return [v convertRect:v.bounds toView:nil]; }
-
-static void WCPLProbeGestures(NSMutableString *s, NSString *tag, UIView *v) {
-    for (UIGestureRecognizer *g in v.gestureRecognizers)
-        [s appendFormat:@"  g[%@] %@ st=%ld en=%d del=%@\n", tag, NSStringFromClass(g.class), (long)g.state, g.enabled,
-            g.delegate ? NSStringFromClass([(NSObject *)g.delegate class]) : @"-"];
-}
-
-static void WCPLProbeDump(UITableViewCell *opened) {
-    UIWindow *win = UIApplication.sharedApplication.keyWindow;
-    UITableView *t = (UITableView *)opened.superview.superview;
-    if (!win || ![t isKindOfClass:UITableView.class]) return;
-    NSMutableString *s = [NSMutableString string];
-    [s appendFormat:@"WCPL 0.1.10 iOS %@ WX %@\n", UIDevice.currentDevice.systemVersion,
-        NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"]];
-    // Which row was under the finger vs which row opened -> tells us whether the touch is mis-mapped.
-    UITableViewCell *under = nil;
-    for (UITableViewCell *c in t.visibleCells)
-        if (CGRectContainsPoint(WCPLWin(c), CGPointMake(CGRectGetMidX(WCPLWin(c)), gProbeHitWin.y))) under = c;
-    NSIndexPath *ipOpen = [t indexPathForCell:opened], *ipUnder = under ? [t indexPathForCell:under] : nil;
-    NSIndexPath *ipRow = [t indexPathForRowAtPoint:[t convertPoint:gProbeHitWin fromView:nil]];
-    [s appendFormat:@"touch win(%.0f,%.0f) %.2fs ago\n under=%ld-%ld rowAtPt=%ld-%ld OPENED=%ld-%ld %@\n",
-        gProbeHitWin.x, gProbeHitWin.y, CACurrentMediaTime() - gProbeHitTime,
-        (long)ipUnder.section, (long)ipUnder.row, (long)ipRow.section, (long)ipRow.row,
-        (long)ipOpen.section, (long)ipOpen.row, [ipUnder isEqual:ipOpen] ? @"OK" : @"MISMATCH"];
-    [s appendFormat:@"[T] bounds%@ inset T%.0f\n", WCPLR(t.bounds), t.contentInset.top];
-    WCPLProbeGestures(s, @"T", t);
-    WCPLProbeGestures(s, @"W", opened.superview);
-    [s appendFormat:@"[OPEN] %@ win%@ clip=%d\n", NSStringFromClass(opened.class), WCPLR(WCPLWin(opened)), opened.clipsToBounds];
-    WCPLProbeGestures(s, @"cell", opened);
-    WCPLProbeGestures(s, @"cv", opened.contentView);
-    for (UIView *v in opened.subviews) {
-        [s appendFormat:@" - %@ %@\n", NSStringFromClass(v.class), WCPLR(WCPLWin(v))];
-        if (v == opened.contentView) continue;
-        for (UIView *b in v.subviews) [s appendFormat:@"    - %@ %@\n", NSStringFromClass(b.class), WCPLR(WCPLWin(b))];
-    }
-    int i = 0;
-    for (UITableViewCell *c in t.visibleCells) {
-        if (i++ >= 7) break;
-        [s appendFormat:@"[C%d] %@ win%@ cv.x=%.0f%@\n", i, NSStringFromClass(c.class), WCPLR(WCPLWin(c)),
-            c.contentView.frame.origin.x, c == opened ? @" <OPEN" : @""];
-    }
-    UIPasteboard.generalPasteboard.string = s;
-    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectInset(win.bounds, 8, 90)];
-    tv.editable = NO;
-    tv.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
-    tv.textColor = UIColor.whiteColor;
-    tv.backgroundColor = [UIColor colorWithWhite:0 alpha:0.85];
-    tv.text = [@"已复制到剪贴板，点此关闭\n" stringByAppendingString:s];
-    [tv addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:tv action:@selector(removeFromSuperview)]];
-    [win addSubview:tv];
-}
-
-// Record each touch-down on the home table; ~0.9s later, if a row is open (contentView slid far left), dump.
-%hook MainFrameTableView
-- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
-    UIView *r = %orig;
-    if (!WCPLBool(@"WCPLSwipeProbe") || e.type != UIEventTypeTouches || CACurrentMediaTime() - gProbeHitTime < 0.3) return r;
-    gProbeHitWin = [(UIView *)self convertPoint:p toView:nil];
-    gProbeHitTime = CACurrentMediaTime();
-    __weak UITableView *weakT = (UITableView *)self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        static CFTimeInterval last;
-        if (CACurrentMediaTime() - last < 4) return;
-        for (UITableViewCell *c in weakT.visibleCells) {
-            if (c.contentView.frame.origin.x > -40) continue;
-            last = CACurrentMediaTime();
-            WCPLProbeDump(c);
-            return;
-        }
-    });
-    return r;
-}
-%end
-
 #pragma mark - 4. 消息直达 (WCPush2Chat 0x4bbc / 0x4e28 / 0x5530 / 0x5974)
 
 // Tapping a message notification opens that chat directly (full-screen push or half-screen sheet).
@@ -310,8 +229,7 @@ static NSArray<NSArray *> *WCPLRows(void) {
         @[@"首页圆角（重启微信生效）", @[@"S", @"启用首页圆角", @"WCPLHomeCorner"],
                                      @[@"T", @"↳ 上下间距", @"WCPLHomeCornerVPadding"],
                                      @[@"T", @"↳ 背景颜色", @"WCPLHomeCornerLight"],
-                                     @[@"T", @"↳ 深色背景颜色", @"WCPLHomeCornerDark"],
-                                     @[@"S", @"↳ 左滑诊断(调试)", @"WCPLSwipeProbe"]],
+                                     @[@"T", @"↳ 深色背景颜色", @"WCPLHomeCornerDark"]],
         @[@"视频", @[@"S", @"启用视频倍速手势", @"WCPLVideoSpeed"],
                   @[@"T", @"↳ 左侧倍速", @"WCPLLeftSpeed"],
                   @[@"T", @"↳ 右侧倍速", @"WCPLRightSpeed"]],
