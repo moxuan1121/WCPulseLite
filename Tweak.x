@@ -106,6 +106,12 @@ static CGFloat WCPLPad(void) { return [WCPLDefaults() doubleForKey:@"WCPLHomeCor
     // Plain UIView children are WeChat's opaque backdrops; clear them so the cell color shows.
     for (UIView *v in cell.subviews)
         if (v.class == UIView.class) v.backgroundColor = UIColor.clearColor;
+    cell.clipsToBounds = YES;   // keep WeChat's swipe buttons/content inside the card (see 2b)
+}
+// UIKit toggles clipping per row for the rounded corners (on for first/last, off for middle); keep it on.
+- (void)setClipsToBounds:(BOOL)clip {
+    UIView *cell = (UIView *)self;
+    %orig(clip || (WCPLBool(@"WCPLHomeCorner") && [cell.superview.superview isKindOfClass:%c(MainFrameTableView)]));
 }
 %end
 
@@ -141,100 +147,58 @@ static void WCPLClearBG(id view) {
 
 #pragma mark - 2b. 圆角左滑菜单对齐
 
-// With the inset card, UIKit still sizes the swipe-action bar (UISwipeActionPullView) out to the
-// table's edge, ~20pt past the card. First/last rows hide it under their rounded-corner clip; middle
-// rows show the overhang, and while a row closes its overhang lingers in the margin where the next
-// left swipe starts, so that swipe grabs the wrong row. Clamp the bar to the card's right edge.
-@interface UISwipeActionPullView : UIView @end
+// WeChat 8.0.33 swipes home rows itself (not UIKit's pull view): it slides contentView left and adds a
+// plain UIView button bar, laid out for a full-screen-width row. With the inset card the row is 40pt
+// narrower, so the buttons overhang the card on the right and the content overhangs on the left.
+// First/last rows get clipped by UIKit's rounded-corner mask and look right; middle rows had no clip.
+// So clip every home row to its own bounds (see the MMTableViewCell hook above).
 
-static UITableView *WCPLHomeTable(UIView *v) {
-    if (!WCPLBool(@"WCPLHomeCorner")) return nil;
-    for (UIView *s = v.superview; s; s = s.superview)
-        if ([s isKindOfClass:%c(MainFrameTableView)]) return (UITableView *)s;
-    return nil;
-}
-
-// Card right edge in `space` coords. The swiped cell slides left, so the max over visible cells is the
-// resting card edge. CGFLOAT_MAX = cells aren't inset, nothing to clamp.
-static CGFloat WCPLCardMaxX(UITableView *t, UIView *space) {
-    CGFloat maxX = 0;
-    for (UITableViewCell *c in t.visibleCells) maxX = MAX(maxX, CGRectGetMaxX([c convertRect:c.bounds toView:t]));
-    if (maxX <= 0 || maxX >= CGRectGetMaxX(t.bounds) - 0.5) return CGFLOAT_MAX;
-    return [t convertPoint:CGPointMake(maxX, 0) toView:space].x;
-}
-
-static CGRect WCPLClampPull(UIView *pull, CGRect f) {
-    UITableView *t = WCPLHomeTable(pull);
-    if (!t || !pull.superview) return f;
-    CGFloat edge = WCPLCardMaxX(t, pull.superview);
-    if (CGRectGetMaxX(f) > edge + 0.5 && edge > CGRectGetMinX(f)) f.size.width = edge - CGRectGetMinX(f);
-    return f;
-}
-
-// ---- 左滑诊断 (WCPLSwipeProbe): dump real hierarchy/frames to screen + pasteboard ----
-static unsigned long gProbePullLayout, gProbePullFrame, gProbeClamp, gProbeTouch, gProbeTableLayout;
+// ---- 左滑诊断 (WCPLSwipeProbe): dump real hierarchy/frames/gestures to screen + pasteboard ----
+static CGPoint gProbeHitWin;            // last touch-down point the home table saw (window coords)
+static CFTimeInterval gProbeHitTime;
 
 static NSString *WCPLR(CGRect r) { return [NSString stringWithFormat:@"(%.0f,%.0f %.0fx%.0f)", r.origin.x, r.origin.y, r.size.width, r.size.height]; }
 static CGRect WCPLWin(UIView *v) { return [v convertRect:v.bounds toView:nil]; }
 
-static void WCPLFindSwipe(UIView *v, NSMutableArray *out, int depth) {
-    if (out.count >= 4 || depth > 12) return;
-    NSString *n = NSStringFromClass(v.class);
-    if ([n containsString:@"Swipe"] || [n containsString:@"PullView"]) { [out addObject:v]; return; }
-    for (UIView *s in v.subviews) WCPLFindSwipe(s, out, depth + 1);
+static void WCPLProbeGestures(NSMutableString *s, NSString *tag, UIView *v) {
+    for (UIGestureRecognizer *g in v.gestureRecognizers)
+        [s appendFormat:@"  g[%@] %@ st=%ld en=%d del=%@\n", tag, NSStringFromClass(g.class), (long)g.state, g.enabled,
+            g.delegate ? NSStringFromClass([(NSObject *)g.delegate class]) : @"-"];
 }
 
-static void WCPLProbeDump(void) {
+static void WCPLProbeDump(UITableViewCell *opened) {
     UIWindow *win = UIApplication.sharedApplication.keyWindow;
-    if (!win) return;
+    UITableView *t = (UITableView *)opened.superview.superview;
+    if (!win || ![t isKindOfClass:UITableView.class]) return;
     NSMutableString *s = [NSMutableString string];
-    [s appendFormat:@"WCPL %@ iOS %@ WX %@\n", @"0.1.9", UIDevice.currentDevice.systemVersion,
+    [s appendFormat:@"WCPL 0.1.10 iOS %@ WX %@\n", UIDevice.currentDevice.systemVersion,
         NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"]];
-    [s appendFormat:@"cnt pullLay=%lu pullFrm=%lu clamp=%lu touch=%lu tblLay=%lu\n",
-        gProbePullLayout, gProbePullFrame, gProbeClamp, gProbeTouch, gProbeTableLayout];
-    NSMutableArray *sw = [NSMutableArray array];
-    WCPLFindSwipe(win, sw, 0);
-    UITableView *t = nil;
-    for (UIView *v in sw) {
-        [s appendFormat:@"\n[S] %@ %@ clip=%d\n", NSStringFromClass(v.class), WCPLR(WCPLWin(v)), v.clipsToBounds];
-        for (UIView *a = v.superview; a && a != win; a = a.superview) {
-            [s appendFormat:@"  ^ %@ %@ clip=%d\n", NSStringFromClass(a.class), WCPLR(WCPLWin(a)), a.clipsToBounds];
-            if (!t && [a isKindOfClass:UITableView.class]) { t = (UITableView *)a; break; }
-        }
-        for (UIView *c in v.subviews) {
-            [s appendFormat:@"  - %@ %@\n", NSStringFromClass(c.class), WCPLR(WCPLWin(c))];
-            for (UIView *g in c.subviews) [s appendFormat:@"    - %@ %@\n", NSStringFromClass(g.class), WCPLR(WCPLWin(g))];
-        }
+    // Which row was under the finger vs which row opened -> tells us whether the touch is mis-mapped.
+    UITableViewCell *under = nil;
+    for (UITableViewCell *c in t.visibleCells)
+        if (CGRectContainsPoint(WCPLWin(c), CGPointMake(CGRectGetMidX(WCPLWin(c)), gProbeHitWin.y))) under = c;
+    NSIndexPath *ipOpen = [t indexPathForCell:opened], *ipUnder = under ? [t indexPathForCell:under] : nil;
+    NSIndexPath *ipRow = [t indexPathForRowAtPoint:[t convertPoint:gProbeHitWin fromView:nil]];
+    [s appendFormat:@"touch win(%.0f,%.0f) %.2fs ago\n under=%ld-%ld rowAtPt=%ld-%ld OPENED=%ld-%ld %@\n",
+        gProbeHitWin.x, gProbeHitWin.y, CACurrentMediaTime() - gProbeHitTime,
+        (long)ipUnder.section, (long)ipUnder.row, (long)ipRow.section, (long)ipRow.row,
+        (long)ipOpen.section, (long)ipOpen.row, [ipUnder isEqual:ipOpen] ? @"OK" : @"MISMATCH"];
+    [s appendFormat:@"[T] bounds%@ inset T%.0f\n", WCPLR(t.bounds), t.contentInset.top];
+    WCPLProbeGestures(s, @"T", t);
+    WCPLProbeGestures(s, @"W", opened.superview);
+    [s appendFormat:@"[OPEN] %@ win%@ clip=%d\n", NSStringFromClass(opened.class), WCPLR(WCPLWin(opened)), opened.clipsToBounds];
+    WCPLProbeGestures(s, @"cell", opened);
+    WCPLProbeGestures(s, @"cv", opened.contentView);
+    for (UIView *v in opened.subviews) {
+        [s appendFormat:@" - %@ %@\n", NSStringFromClass(v.class), WCPLR(WCPLWin(v))];
+        if (v == opened.contentView) continue;
+        for (UIView *b in v.subviews) [s appendFormat:@"    - %@ %@\n", NSStringFromClass(b.class), WCPLR(WCPLWin(b))];
     }
-    if (!t) {   // no swipe view found: still report the home table
-        NSMutableArray *st = [NSMutableArray arrayWithObject:win];
-        while (st.count && !t) {
-            UIView *v = st.lastObject; [st removeLastObject];
-            if ([v isKindOfClass:%c(MainFrameTableView)]) t = (UITableView *)v; else [st addObjectsFromArray:v.subviews];
-        }
-    }
-    if (t) {
-        [s appendFormat:@"\n[T] %@ isMF=%d style=%ld win%@ bounds%@\n margins L%.0f R%.0f inset T%.0f B%.0f\n",
-            NSStringFromClass(t.class), [t isKindOfClass:%c(MainFrameTableView)], (long)t.style, WCPLR(WCPLWin(t)),
-            WCPLR(t.bounds), t.layoutMargins.left, t.layoutMargins.right, t.contentInset.top, t.contentInset.bottom];
-        [s appendFormat:@" cardMaxX(table)=%.0f\n", WCPLCardMaxX(t, t)];
-        int i = 0;
-        for (UITableViewCell *c in t.visibleCells) {
-            if (i++ >= 6) break;
-            [s appendFormat:@"[C%d] %@ frm%@ win%@ sup=%@\n", i, NSStringFromClass(c.class), WCPLR(c.frame), WCPLR(WCPLWin(c)),
-                NSStringFromClass(c.superview.class)];
-            int j = 0;
-            for (UIView *v in c.subviews) {
-                if (j++ >= 6) break;
-                [s appendFormat:@"   - %@ %@\n", NSStringFromClass(v.class), WCPLR(WCPLWin(v))];
-            }
-        }
-        [s appendString:@"[T.subviews]\n"];
-        int k = 0;
-        for (UIView *v in t.subviews) {
-            if (k++ >= 14) break;
-            [s appendFormat:@" %@ %@\n", NSStringFromClass(v.class), WCPLR(WCPLWin(v))];
-        }
+    int i = 0;
+    for (UITableViewCell *c in t.visibleCells) {
+        if (i++ >= 7) break;
+        [s appendFormat:@"[C%d] %@ win%@ cv.x=%.0f%@\n", i, NSStringFromClass(c.class), WCPLR(WCPLWin(c)),
+            c.contentView.frame.origin.x, c == opened ? @" <OPEN" : @""];
     }
     UIPasteboard.generalPasteboard.string = s;
     UITextView *tv = [[UITextView alloc] initWithFrame:CGRectInset(win.bounds, 8, 90)];
@@ -247,54 +211,25 @@ static void WCPLProbeDump(void) {
     [win addSubview:tv];
 }
 
-// Called from several hooks so we learn which ones fire; dumps 0.6s later once the swipe settles.
-static void WCPLProbeKick(void) {
-    if (!WCPLBool(@"WCPLSwipeProbe")) return;
-    static CFTimeInterval last;
-    CFTimeInterval now = CACurrentMediaTime();
-    if (now - last < 4) return;
-    last = now;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ WCPLProbeDump(); });
-}
-
-%hook UISwipeActionPullView
-- (void)setFrame:(CGRect)f {
-    gProbePullFrame++;
-    CGRect c = WCPLClampPull(self, f);
-    if (!CGRectEqualToRect(c, f)) gProbeClamp++;
-    %orig(c);
-}
-// Catches frames set before insertion or via bounds/center; the clamped setFrame: won't loop.
-- (void)layoutSubviews {
-    %orig;
-    gProbePullLayout++;
-    WCPLProbeKick();
-    if (!WCPLHomeTable(self)) return;
-    self.clipsToBounds = YES;   // buttons stretched for over-swipe must not paint past the card either
-    CGRect f = WCPLClampPull(self, self.frame);
-    if (!CGRectEqualToRect(f, self.frame)) self.frame = f;
-}
-%end
-
-// Touch -> row: use the cell actually drawn under the finger; fall back to UIKit's row math elsewhere.
+// Record each touch-down on the home table; ~0.9s later, if a row is open (contentView slid far left), dump.
 %hook MainFrameTableView
-- (void)layoutSubviews {
-    %orig;
-    gProbeTableLayout++;
-    if (!WCPLBool(@"WCPLSwipeProbe")) return;
-    NSMutableArray *sw = [NSMutableArray array];
-    WCPLFindSwipe(self, sw, 0);
-    if (sw.count) WCPLProbeKick();
-}
-- (id)swipeActionController:(id)controller indexPathForTouchLocation:(CGPoint)p {
-    gProbeTouch++;
-    WCPLProbeKick();
-    id ip = %orig;
-    if (!WCPLBool(@"WCPLHomeCorner")) return ip;
-    UITableView *t = (UITableView *)self;
-    for (UITableViewCell *c in t.visibleCells)
-        if (CGRectContainsPoint([c convertRect:c.bounds toView:t], p)) return [t indexPathForCell:c] ?: ip;
-    return ip;
+- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
+    UIView *r = %orig;
+    if (!WCPLBool(@"WCPLSwipeProbe") || e.type != UIEventTypeTouches || CACurrentMediaTime() - gProbeHitTime < 0.3) return r;
+    gProbeHitWin = [(UIView *)self convertPoint:p toView:nil];
+    gProbeHitTime = CACurrentMediaTime();
+    __weak UITableView *weakT = (UITableView *)self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        static CFTimeInterval last;
+        if (CACurrentMediaTime() - last < 4) return;
+        for (UITableViewCell *c in weakT.visibleCells) {
+            if (c.contentView.frame.origin.x > -40) continue;
+            last = CACurrentMediaTime();
+            WCPLProbeDump(c);
+            return;
+        }
+    });
+    return r;
 }
 %end
 
