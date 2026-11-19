@@ -37,6 +37,7 @@ static NSUserDefaults *WCPLDefaults(void) {
             @"WCPLGroupAtTips": @YES,                 // 群聊艾特提示（有人@你 悬浮条）
             @"WCPLGroupAtTipsSort": @YES,             // 悬浮条点击跳到最新一条@（关=最早一条）
             @"WCPLGroupAtTipsFilterVisible": @YES,    // 屏幕上已看到的@不再提示
+            @"WCPLSwipeProbe": @NO,                   // 调试：左滑时弹出容器/cell 几何探针
         }];
     });
     return d;
@@ -84,12 +85,8 @@ static CGFloat WCPLPad(void) { return [WCPLDefaults() doubleForKey:@"WCPLHomeCor
     CGFloat pad = WCPLPad();
     t.sectionHeaderHeight = pad;
     t.sectionFooterHeight = pad;
-    // Top/bottom breathing room via spacer header/footer, NOT contentInset: a top contentInset
-    // desyncs UIKit's trailing-swipe-action container Y from the cell, shifting the 标为/删除 menu
-    // up by ~one row on the rows next to a rounded corner. Header/footer views keep geometry intact.
-    // ponytail: spacer views, not contentInset. If a build ever needs the old inset, restore here.
-    t.tableHeaderView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, frame.size.width, pad)];
-    t.tableFooterView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, frame.size.width, pad)];
+    t.contentInset = UIEdgeInsetsMake(pad, 0, pad, 0);
+    t.scrollIndicatorInsets = UIEdgeInsetsMake(pad, 0, pad, 0);
     if (@available(iOS 15.0, *)) t.sectionHeaderTopPadding = pad;
     return t;
 }
@@ -139,6 +136,51 @@ static void WCPLClearBG(id view) {
 - (void)layoutSubviews {
     %orig;
     WCPLClearBG(self);
+}
+%end
+
+#pragma mark - 2b. 左滑几何探针（调试，WCPLSwipeProbe）
+
+// Dumps the swipe-action container frame vs. the matching cell frame when you swipe a home-list row,
+// so we can see the exact Y offset and class names without Filza. Legacy swipe hierarchy (iOS13-16):
+// UITableView -> _UITableViewCellSwipeContainerView -> UISwipeActionPullView -> UISwipeActionStandardButton.
+// Hooking the container's setFrame: catches the exact moment UIKit positions it.
+%hook _UITableViewCellSwipeContainerView
+- (void)setFrame:(CGRect)frame {
+    %orig;
+    if (!WCPLBool(@"WCPLSwipeProbe")) return;
+    // Container may sit directly under the table or under a wrapper; walk up to the UITableView.
+    UIView *sup = self.superview;
+    UITableView *table = nil;
+    for (UIView *v = sup; v; v = v.superview) if ([v isKindOfClass:UITableView.class]) { table = (UITableView *)v; break; }
+    if (!table) return;
+    // Nearest visible cell by vertical center.
+    UITableViewCell *near = nil; CGFloat best = CGFLOAT_MAX;
+    for (UITableViewCell *c in table.visibleCells) {
+        CGFloat d = fabs(CGRectGetMidY(c.frame) - CGRectGetMidY(frame));
+        if (d < best) { best = d; near = c; }
+    }
+    static CFTimeInterval lastShow; CFTimeInterval now = CACurrentMediaTime();
+    if (now - lastShow < 0.8) return;                // throttle: one dump per swipe
+    lastShow = now;
+    NSString *msg = [NSString stringWithFormat:
+        @"container=%@\n superview=%@\n frame.y=%.1f h=%.1f\ncell=%@\n frame.y=%.1f h=%.1f\nΔy(container-cell)=%.1f\ntable.contentInset.top=%.1f",
+        NSStringFromClass(self.class), NSStringFromClass(sup.class), frame.origin.y, frame.size.height,
+        near ? NSStringFromClass(near.class) : @"(none)",
+        near.frame.origin.y, near.frame.size.height,
+        frame.origin.y - near.frame.origin.y,
+        table.contentInset.top];
+    // Non-blocking banner on the key window (an alert would eat the swipe).
+    UIWindow *win = UIApplication.sharedApplication.keyWindow;
+    if (!win) return;
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(8, 60, win.bounds.size.width - 16, 150)];
+    l.numberOfLines = 0;
+    l.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+    l.textColor = UIColor.whiteColor;
+    l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.8];
+    l.text = msg;
+    [win addSubview:l];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [l removeFromSuperview]; });
 }
 %end
 
@@ -218,7 +260,8 @@ static NSArray<NSArray *> *WCPLRows(void) {
         @[@"首页圆角（重启微信生效）", @[@"S", @"启用首页圆角", @"WCPLHomeCorner"],
                                      @[@"T", @"↳ 上下间距", @"WCPLHomeCornerVPadding"],
                                      @[@"T", @"↳ 背景颜色", @"WCPLHomeCornerLight"],
-                                     @[@"T", @"↳ 深色背景颜色", @"WCPLHomeCornerDark"]],
+                                     @[@"T", @"↳ 深色背景颜色", @"WCPLHomeCornerDark"],
+                                     @[@"S", @"↳ 左滑几何探针(调试)", @"WCPLSwipeProbe"]],
         @[@"视频", @[@"S", @"启用视频倍速手势", @"WCPLVideoSpeed"],
                   @[@"T", @"↳ 左侧倍速", @"WCPLLeftSpeed"],
                   @[@"T", @"↳ 右侧倍速", @"WCPLRightSpeed"]],
