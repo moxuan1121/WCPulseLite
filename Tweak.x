@@ -145,6 +145,7 @@ static void WCPLClearBG(id view) {
 // so we can see the exact Y offset and class names without Filza. Legacy swipe hierarchy (iOS13-16):
 // UITableView -> _UITableViewCellSwipeContainerView -> UISwipeActionPullView -> UISwipeActionStandardButton.
 // Hooking the container's setFrame: catches the exact moment UIKit positions it.
+@interface _UITableViewCellSwipeContainerView : UIView @end
 %hook _UITableViewCellSwipeContainerView
 - (void)setFrame:(CGRect)frame {
     %orig;
