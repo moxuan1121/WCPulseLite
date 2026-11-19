@@ -84,8 +84,12 @@ static CGFloat WCPLPad(void) { return [WCPLDefaults() doubleForKey:@"WCPLHomeCor
     CGFloat pad = WCPLPad();
     t.sectionHeaderHeight = pad;
     t.sectionFooterHeight = pad;
-    t.contentInset = UIEdgeInsetsMake(pad, 0, pad, 0);
-    t.scrollIndicatorInsets = UIEdgeInsetsMake(pad, 0, pad, 0);
+    // Top/bottom breathing room via spacer header/footer, NOT contentInset: a top contentInset
+    // desyncs UIKit's trailing-swipe-action container Y from the cell, shifting the 标为/删除 menu
+    // up by ~one row on the rows next to a rounded corner. Header/footer views keep geometry intact.
+    // ponytail: spacer views, not contentInset. If a build ever needs the old inset, restore here.
+    t.tableHeaderView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, frame.size.width, pad)];
+    t.tableFooterView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, frame.size.width, pad)];
     if (@available(iOS 15.0, *)) t.sectionHeaderTopPadding = pad;
     return t;
 }
