@@ -1,4 +1,4 @@
-// WCPulseLite — WeChat features extracted from WCPulse.dylib (sections 1-3) and WCPush2Chat.dylib (section 4).
+// WCPulseLite — WeChat features extracted from WCPulse.dylib and WCPush2Chat.dylib (消息直达 + settings entry).
 // Each block below names the original function address it mirrors.
 #import <UIKit/UIKit.h>
 #import <UserNotifications/UserNotifications.h>
@@ -49,6 +49,65 @@ static UIColor *WCPLHex(NSString *hex) {
     return [UIColor colorWithRed:((v >> 16) & 0xFF) / 255.0 green:((v >> 8) & 0xFF) / 255.0 blue:(v & 0xFF) / 255.0 alpha:1];
 }
 
+#pragma mark - Shared WeChat helpers
+
+@interface CContact : NSObject
+@property (nonatomic, copy) NSString *m_nsUsrName;
+@end
+@interface CMessageWrap : NSObject
+- (instancetype)initWithMsgType:(long long)type;
+@property (nonatomic, copy) NSString *m_nsContent, *m_nsFromUsr, *m_nsToUsr, *m_nsRealChatUsr;
+@property (nonatomic) unsigned int m_uiCreateTime, m_uiStatus, m_uiMessageType;
+@property (nonatomic, readonly) unsigned int m_uiMesLocalID;
+@property (nonatomic, copy, readonly) NSString *m_nsAtUserList;
+@end
+@interface BaseMsgContentViewController : UIViewController
+- (CContact *)getChatContact;
+- (NSArray *)GetMessagesWrapArray;
+@end
+
+// WeChat's service locator. Returns nil (instead of crashing) if any link of the chain is missing.
+static id WCPLService(NSString *name) {
+    Class cls = NSClassFromString(name), ctxCls = %c(MMContext);
+    id ctx = [ctxCls respondsToSelector:@selector(currentContext)] ? [ctxCls performSelector:@selector(currentContext)] : nil;
+    id center = [ctx respondsToSelector:@selector(serviceCenter)] ? [ctx performSelector:@selector(serviceCenter)] : nil;
+    return cls && [center respondsToSelector:@selector(getService:)] ? [center performSelector:@selector(getService:) withObject:cls] : nil;
+}
+
+static NSString *WCPLMyWxid(void) {
+    Class su = %c(SettingUtil);
+    NSString *me = [su respondsToSelector:@selector(getLocalUsrName:)] ? [su performSelector:@selector(getLocalUsrName:) withObject:nil] : nil;
+    return [me isKindOfClass:NSString.class] && me.length ? me : nil;
+}
+
+static UIViewController *WCPLOwnerVC(UIView *v) {
+    Class chat = %c(BaseMsgContentViewController);
+    for (UIResponder *r = v; r; r = r.nextResponder)
+        if ([r isKindOfClass:chat]) return (UIViewController *)r;
+    return nil;
+}
+
+// wxid / room id of the chat a BaseMsgContentViewController shows.
+static NSString *WCPLChatUser(UIViewController *vc) {
+    id contact = [vc respondsToSelector:@selector(getChatContact)] ? [(BaseMsgContentViewController *)vc getChatContact] : nil;
+    NSString *u = [contact respondsToSelector:@selector(m_nsUsrName)] ? [contact m_nsUsrName] : nil;
+    return [u isKindOfClass:NSString.class] ? u : nil;
+}
+
+// Scroll a chat to a message and highlight it (WeChat's own scrollToMessage:highlight:marginTop:animated:).
+static BOOL WCPLScrollToMsg(id vc, id msg) {
+    SEL sel = @selector(scrollToMessage:highlight:marginTop:animated:);
+    if (!msg || ![vc respondsToSelector:sel]) return NO;
+    ((void (*)(id, SEL, id, BOOL, double, BOOL))objc_msgSend)(vc, sel, msg, YES, UIScreen.mainScreen.bounds.size.height / 3, YES);
+    return YES;
+}
+
+static void WCPLHaptic(void) {
+    static UIImpactFeedbackGenerator *gen;
+    if (!gen) gen = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [gen impactOccurred];
+}
+
 #pragma mark - 1. 置顶点击保留 (0xc27c0 / 0xc2894)
 
 // Tapping the pinned-message bar makes WeChat drop the pin locally.
@@ -94,24 +153,42 @@ static CGFloat WCPLPad(void) { return [WCPLDefaults() doubleForKey:@"WCPLHomeCor
 }
 %end
 
+// Original (0x1c2280..0x1c2318) checks cell.superview.superview (the wrapper view's table), not cell.superview.
+static BOOL WCPLIsHomeCell(UIView *cell) {
+    return WCPLBool(@"WCPLHomeCorner") && [cell.superview.superview isKindOfClass:%c(MainFrameTableView)];
+}
+
+// Card color, parsed once per hex string instead of on every cell layout.
+static UIColor *WCPLCardColor(BOOL dark) {
+    static NSString *lightHex, *darkHex;
+    static UIColor *light, *darkColor;
+    NSString *hex = [WCPLDefaults() stringForKey:dark ? @"WCPLHomeCornerDark" : @"WCPLHomeCornerLight"];
+    if (dark) {
+        if (!darkColor || ![hex isEqualToString:darkHex]) { darkHex = hex; darkColor = WCPLHex(hex); }
+        return darkColor;
+    }
+    if (!light || ![hex isEqualToString:lightHex]) { lightHex = hex; light = WCPLHex(hex); }
+    return light;
+}
+
+// Left swipe: WeChat 8.0.33 swipes home rows itself (not UIKit's pull view) — it slides contentView left and
+// adds a plain UIView button bar laid out for a full-screen-width row. In the inset card the row is 40pt
+// narrower, so buttons/content overhang the card. UIKit clips only first/last rows (rounded corners), so
+// middle rows misaligned and caught touches meant for other rows. Clipping every home row fixes both.
 %hook MMTableViewCell
 - (void)layoutSubviews {
     %orig;
     UITableViewCell *cell = (UITableViewCell *)self;
-    // Original (0x1c2280..0x1c2318) checks cell.superview.superview, not cell.superview.
-    if (!WCPLBool(@"WCPLHomeCorner") || ![cell.superview.superview isKindOfClass:%c(MainFrameTableView)]) return;
-    BOOL dark = UITraitCollection.currentTraitCollection.userInterfaceStyle == UIUserInterfaceStyleDark;
-    cell.backgroundColor = WCPLHex([WCPLDefaults() stringForKey:dark ? @"WCPLHomeCornerDark" : @"WCPLHomeCornerLight"]);
+    if (!WCPLIsHomeCell(cell)) return;
+    cell.backgroundColor = WCPLCardColor(cell.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
     // Plain UIView children are WeChat's opaque backdrops; clear them so the cell color shows.
     for (UIView *v in cell.subviews)
         if (v.class == UIView.class) v.backgroundColor = UIColor.clearColor;
-    cell.clipsToBounds = YES;   // keep WeChat's swipe buttons/content inside the card (see 2b)
+    cell.clipsToBounds = YES;
 }
 // UIKit toggles clipping per row for the rounded corners (on for first/last, off for middle); keep it on.
 - (void)setClipsToBounds:(BOOL)clip {
-    UIView *cell = (UIView *)self;
-    BOOL home = WCPLBool(@"WCPLHomeCorner") && [cell.superview.superview isKindOfClass:%c(MainFrameTableView)];
-    %orig(clip || home);
+    %orig(clip || WCPLIsHomeCell((UIView *)self));
 }
 %end
 
@@ -142,512 +219,6 @@ static void WCPLClearBG(id view) {
 - (void)layoutSubviews {
     %orig;
     WCPLClearBG(self);
-}
-%end
-
-#pragma mark - 2b. 圆角左滑菜单对齐
-
-// WeChat 8.0.33 swipes home rows itself (not UIKit's pull view): it slides contentView left and adds a
-// plain UIView button bar, laid out for a full-screen-width row. With the inset card the row is 40pt
-// narrower, so the buttons overhang the card on the right and the content overhangs on the left.
-// First/last rows get clipped by UIKit's rounded-corner mask and look right; middle rows had no clip.
-// So clip every home row to its own bounds (see the MMTableViewCell hook above).
-
-#pragma mark - 4. 消息直达 (WCPush2Chat 0x4bbc / 0x4e28 / 0x5530 / 0x5974)
-
-// Tapping a message notification opens that chat directly (full-screen push or half-screen sheet).
-@interface CContact : NSObject
-@property (nonatomic, copy) NSString *m_nsUsrName;
-@end
-@interface BaseMsgContentViewController : UIViewController
-- (CContact *)getChatContact;
-@end
-
-static id WCPLService(NSString *name) {
-    id center = [[%c(MMContext) performSelector:@selector(currentContext)] performSelector:@selector(serviceCenter)];
-    return [center performSelector:@selector(getService:) withObject:NSClassFromString(name)];
-}
-
-static UIViewController *WCPLTopVC(void) {
-    UIViewController *vc = UIApplication.sharedApplication.keyWindow.rootViewController;
-    for (;;) {
-        if (vc.presentedViewController) vc = vc.presentedViewController;
-        else if ([vc isKindOfClass:UITabBarController.class]) vc = ((UITabBarController *)vc).selectedViewController;
-        else if ([vc isKindOfClass:UINavigationController.class]) vc = ((UINavigationController *)vc).visibleViewController;
-        else return vc;
-    }
-}
-
-static void WCPLOpenChat(CContact *contact, UIViewController *vc, BOOL foreground) {
-    BOOL half = [WCPLDefaults() integerForKey:foreground ? @"WCPLPushFGMode" : @"WCPLPushBGMode"] == 1;
-    if (half)
-        [WCPLService(@"QuickReplyMsgMgr") performSelector:@selector(showPageSheetSession:fromViewController:) withObject:contact withObject:vc];
-    else
-        ((void (*)(id, SEL, id, id, BOOL))objc_msgSend)(WCPLService(@"MMMsgLogicManager"),
-            @selector(PushOtherBaseMsgControllerByContact:navigationController:animated:), contact, vc.navigationController, YES);
-}
-
-// UI may not be ready right after a cold launch: retry every 0.5s, give up after 10 tries (as the original).
-static void WCPLPushToChat(UNNotificationResponse *response, BOOL foreground) {
-    NSString *user = response.notification.request.content.userInfo[@"u"];
-    if (![user isKindOfClass:NSString.class]) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        CContact *contact = [WCPLService(@"CContactMgr") performSelector:@selector(getContactByName:) withObject:user];
-        if (!contact) return;
-        __block int tries = 0;
-        [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
-            UIViewController *top = WCPLTopVC();
-            if (!top.navigationController) { if (++tries >= 10) [t invalidate]; return; }
-            [t invalidate];
-            if (foreground && [top isKindOfClass:%c(BaseMsgContentViewController)] &&
-                [[(BaseMsgContentViewController *)top getChatContact].m_nsUsrName isEqualToString:user]) return;
-            WCPLOpenChat(contact, top, foreground);
-        }];
-    });
-}
-
-%hook MicroMessengerAppDelegate
-- (void)userNotificationCenter:(id)c didReceiveNotificationResponse:(UNNotificationResponse *)r withCompletionHandler:(id)h {
-    if (WCPLBool(@"WCPLPushBG")) WCPLPushToChat(r, NO);
-    %orig;
-}
-%end
-
-%hook NotificationActionsMgr
-- (void)userNotificationCenter:(id)c didReceiveNotificationResponse:(UNNotificationResponse *)r withCompletionHandler:(id)h {
-    if (WCPLBool(@"WCPLPushFG")) WCPLPushToChat(r, YES);
-    %orig;
-}
-%end
-
-#pragma mark - 5. 设置页 (entry mirrors WCPush2Chat 0x527c / 0x5498)
-
-// Row kinds: S = switch, T = text (alert input), M = 全屏/半屏 segment.
-static NSArray<NSArray *> *WCPLRows(void) {
-    return @[
-        @[@"置顶", @[@"S", @"启用置顶点击保留", @"WCPLTopClickKeep"]],
-        @[@"首页圆角（重启微信生效）", @[@"S", @"启用首页圆角", @"WCPLHomeCorner"],
-                                     @[@"T", @"↳ 上下间距", @"WCPLHomeCornerVPadding"],
-                                     @[@"T", @"↳ 背景颜色", @"WCPLHomeCornerLight"],
-                                     @[@"T", @"↳ 深色背景颜色", @"WCPLHomeCornerDark"]],
-        @[@"视频", @[@"S", @"启用视频倍速手势", @"WCPLVideoSpeed"],
-                  @[@"T", @"↳ 左侧倍速", @"WCPLLeftSpeed"],
-                  @[@"T", @"↳ 右侧倍速", @"WCPLRightSpeed"]],
-        @[@"消息", @[@"S", @"启用防撤回", @"WCPLNoRevoke"],
-                  @[@"S", @"左滑消息引用/撤回", @"WCPLSwipeMsg"],
-                  @[@"T", @"↳ 撤回提示时间格式", @"WCPLTimeFormat"]],
-        @[@"引用", @[@"S", @"点击引用跳转到原消息", @"WCPLReferJump"],
-                  @[@"S", @"↳ 引用图片也跳转", @"WCPLReferJumpImage"],
-                  @[@"S", @"↳ 引用视频也跳转", @"WCPLReferJumpVideo"]],
-        @[@"群聊艾特", @[@"S", @"启用群聊艾特提示", @"WCPLGroupAtTips"],
-                     @[@"S", @"↳ 跳到最新一条@（关=最早）", @"WCPLGroupAtTipsSort"],
-                     @[@"S", @"↳ 已看到的@不再提示", @"WCPLGroupAtTipsFilterVisible"]],
-        @[@"输入框", @[@"S", @"空输入框长按语音", @"WCPLEmptyInputVoice"]],
-        @[@"消息直达", @[@"S", @"开启前台直达", @"WCPLPushFG"],
-                    @[@"M", @"↳ 前台直达模式", @"WCPLPushFGMode"],
-                    @[@"S", @"开启后台直达", @"WCPLPushBG"],
-                    @[@"M", @"↳ 后台直达模式", @"WCPLPushBGMode"]],
-    ];
-}
-
-@interface WCPLSettingsVC : UITableViewController
-@end
-
-@implementation WCPLSettingsVC
-- (instancetype)init {
-    if ((self = [super initWithStyle:UITableViewStyleInsetGrouped])) self.title = @"WCPulseLite";
-    return self;
-}
-- (NSArray *)row:(NSIndexPath *)ip { return WCPLRows()[ip.section][ip.row + 1]; }
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return WCPLRows().count; }
-- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return WCPLRows()[s].count - 1; }
-- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return WCPLRows()[s][0]; }
-
-- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
-    NSArray *r = [self row:ip];
-    NSString *kind = r[0], *key = r[2];
-    UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
-    c.textLabel.text = r[1];
-    c.selectionStyle = UITableViewCellSelectionStyleNone;
-    if ([kind isEqualToString:@"S"]) {
-        UISwitch *sw = [UISwitch new];
-        sw.on = [WCPLDefaults() boolForKey:key];
-        sw.accessibilityIdentifier = key;
-        [sw addTarget:self action:@selector(toggled:) forControlEvents:UIControlEventValueChanged];
-        c.accessoryView = sw;
-    } else if ([kind isEqualToString:@"M"]) {
-        UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"全屏", @"半屏"]];
-        seg.selectedSegmentIndex = [WCPLDefaults() integerForKey:key];
-        seg.accessibilityIdentifier = key;
-        [seg addTarget:self action:@selector(segmented:) forControlEvents:UIControlEventValueChanged];
-        c.accessoryView = seg;
-    } else {
-        c.detailTextLabel.text = [WCPLDefaults() objectForKey:key] ? [[WCPLDefaults() objectForKey:key] description] : @"";
-        c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        c.selectionStyle = UITableViewCellSelectionStyleDefault;
-    }
-    return c;
-}
-
-- (void)toggled:(UISwitch *)sw { [WCPLDefaults() setBool:sw.on forKey:sw.accessibilityIdentifier]; }
-- (void)segmented:(UISegmentedControl *)s { [WCPLDefaults() setInteger:s.selectedSegmentIndex forKey:s.accessibilityIdentifier]; }
-
-- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
-    [tv deselectRowAtIndexPath:ip animated:YES];
-    NSArray *r = [self row:ip];
-    if (![r[0] isEqualToString:@"T"]) return;
-    NSString *key = r[2];
-    BOOL number = [key isEqualToString:@"WCPLHomeCornerVPadding"];
-    BOOL color = [key hasPrefix:@"WCPLHomeCorner"];
-    double lo = 0, hi = 50;
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:r[1]
-        message:number ? [NSString stringWithFormat:@"%.1f - %.1f", lo, hi] : (color ? @"十六进制颜色，如 #F7F7F7" :
-                 [key isEqualToString:@"WCPLTimeFormat"] ? @"如 MM/dd HH:mm:ss" : @"如 2.0x")
-        preferredStyle:UIAlertControllerStyleAlert];
-    [a addTextFieldWithConfigurationHandler:^(UITextField *f) {
-        f.text = [[WCPLDefaults() objectForKey:key] description];
-        if (number) f.keyboardType = UIKeyboardTypeDecimalPad;
-    }];
-    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [a addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
-        NSString *v = [a.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-        if (number) [WCPLDefaults() setDouble:MIN(MAX(v.doubleValue, lo), hi) forKey:key];
-        else if (v.length) [WCPLDefaults() setObject:v forKey:key];
-        [tv reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
-    }]];
-    [self presentViewController:a animated:YES completion:nil];
-}
-@end
-
-@interface NewSettingViewController : UIViewController
-@end
-
-%hook NewSettingViewController
-- (void)reloadTableData {
-    %orig;
-    Ivar iv = class_getInstanceVariable(object_getClass(self), "m_tableViewMgr");
-    id mgr = iv ? object_getIvar(self, iv) : nil;
-    if (!mgr) return;
-    id section = [%c(WCTableViewSectionManager) performSelector:@selector(defaultSection)];
-    id cell = ((id (*)(id, SEL, SEL, id, id, id, BOOL))objc_msgSend)(%c(WCTableViewNormalCellManager),
-        @selector(normalCellForSel:target:title:rightValue:canRightValueCopy:),
-        @selector(wcpl_openSettings), self, @"WCPulseLite", @"", NO);
-    [section performSelector:@selector(addCell:) withObject:cell];
-    ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(mgr, @selector(insertSection:At:), section, 0);
-    [[mgr performSelector:@selector(getTableView)] reloadData];
-}
-
-%new
-- (void)wcpl_openSettings {
-    [self.navigationController pushViewController:[WCPLSettingsVC new] animated:YES];
-}
-%end
-
-#pragma mark - 6. 防撤回 (WCPulse -[MessageRevokeMgr onRevokeMsg:] 0x10588c)
-
-// Instead of letting WeChat delete the message, keep it and insert a local system note after it.
-@interface CMessageWrap : NSObject
-- (instancetype)initWithMsgType:(long long)type;
-@property (nonatomic, copy) NSString *m_nsContent, *m_nsFromUsr, *m_nsToUsr, *m_nsRealChatUsr;
-@property (nonatomic) unsigned int m_uiCreateTime, m_uiStatus, m_uiMessageType;
-@end
-
-static NSString *WCPLXMLValue(NSString *xml, NSString *tag) {
-    NSRange a = [xml rangeOfString:[NSString stringWithFormat:@"<%@>", tag]];
-    NSRange b = [xml rangeOfString:[NSString stringWithFormat:@"</%@>", tag]];
-    if (a.location == NSNotFound || b.location == NSNotFound || b.location < NSMaxRange(a)) return nil;
-    NSString *v = [xml substringWithRange:NSMakeRange(NSMaxRange(a), b.location - NSMaxRange(a))];
-    if ([v hasPrefix:@"<![CDATA["] && [v hasSuffix:@"]]>"]) v = [v substringWithRange:NSMakeRange(9, v.length - 12)];
-    return v;
-}
-
-static NSString *WCPLFormatTime(unsigned int t) {
-    NSDateFormatter *f = [NSDateFormatter new];
-    f.dateFormat = [WCPLDefaults() stringForKey:@"WCPLTimeFormat"];
-    return [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:t]];
-}
-
-%hook MessageRevokeMgr
-- (void)onRevokeMsg:(CMessageWrap *)wrap {
-    if (!WCPLBool(@"WCPLNoRevoke")) {
-        %orig;
-        return;
-    }
-    NSString *xml = wrap.m_nsContent, *session = WCPLXMLValue(xml, @"session") ?: wrap.m_nsFromUsr;
-    NSString *svrID = WCPLXMLValue(xml, @"newmsgid"), *replace = WCPLXMLValue(xml, @"replacemsg") ?: @"";
-    id msgMgr = WCPLService(@"CMessageMgr");
-    CMessageWrap *orig = svrID ? ((id (*)(id, SEL, id, long long))objc_msgSend)(msgMgr, @selector(GetMsg:n64SvrID:), session, svrID.longLongValue) : nil;
-    // My own revokes ("你撤回了一条消息") and unknown messages go through normally.
-    if (!orig || [replace hasPrefix:@"你"]) {
-        %orig;
-        return;
-    }
-
-    NSString *name = [[replace componentsSeparatedByString:@"撤回了"].firstObject
-        stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"\"“” "]];
-    CMessageWrap *note = [[%c(CMessageWrap) alloc] initWithMsgType:10000];   // system tip
-    note.m_nsFromUsr = orig.m_nsFromUsr;
-    note.m_nsToUsr = orig.m_nsToUsr;
-    note.m_uiStatus = 4;
-    note.m_uiCreateTime = orig.m_uiCreateTime + 1;
-    note.m_nsContent = [NSString stringWithFormat:@"%@ 已拦截%@撤回的消息", WCPLFormatTime(orig.m_uiCreateTime), name.length ? name : @"对方"];
-    ((void (*)(id, SEL, id, id, BOOL, BOOL))objc_msgSend)(msgMgr, @selector(AddLocalMsg:MsgWrap:fixTime:NewMsgArriveNotify:), session, note, YES, NO);
-}
-%end
-
-#pragma mark - 7. 左滑消息 (WCPulse wcpulse_handleSwipeGesture: 0xe672c / onReplyMsg: 0xe8ce4)
-
-// Swipe left on a bubble: others' message -> 引用 / 引用并@ (group only); my message -> 撤回 / 引用.
-// Uses WeChat's own cell actions, same as the original: onShowMsgReplyMenuItem:, onRevokeMsg:, longPressOnHeadImage:.
-@interface CommonMessageCellView : UIView
-- (id)viewModel;
-@end
-
-static char kWCPLSwipe;
-static void WCPLHaptic(void);
-
-static UIViewController *WCPLOwnerVC(UIView *v) {
-    for (UIResponder *r = v; r; r = r.nextResponder)
-        if ([r isKindOfClass:%c(BaseMsgContentViewController)]) return (UIViewController *)r;
-    return nil;
-}
-
-static void WCPLCellAction(id cell, SEL sel) {
-    if ([cell respondsToSelector:sel]) ((void (*)(id, SEL, id))objc_msgSend)(cell, sel, nil);
-}
-
-%hook CommonMessageCellView
-- (void)layoutInternal {
-    %orig;
-    if (!WCPLBool(@"WCPLSwipeMsg") || objc_getAssociatedObject(self, &kWCPLSwipe)) return;
-    UISwipeGestureRecognizer *g = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(wcpl_swiped:)];
-    g.direction = UISwipeGestureRecognizerDirectionLeft;
-    [self addGestureRecognizer:g];
-    objc_setAssociatedObject(self, &kWCPLSwipe, g, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-%new
-- (void)wcpl_swiped:(UISwipeGestureRecognizer *)g {
-    if (!WCPLBool(@"WCPLSwipeMsg")) return;
-    CMessageWrap *msg = [[self viewModel] performSelector:@selector(messageWrap)];
-    UIViewController *vc = WCPLOwnerVC(self);
-    if (!msg || !vc) return;
-    NSString *me = [%c(SettingUtil) performSelector:@selector(getLocalUsrName:) withObject:nil];
-    BOOL mine = [msg.m_nsFromUsr isEqualToString:me];
-    NSString *realUsr = [msg respondsToSelector:@selector(m_nsRealChatUsr)] ? msg.m_nsRealChatUsr : nil;
-    BOOL group = [msg.m_nsFromUsr hasSuffix:@"@chatroom"] || [msg.m_nsToUsr hasSuffix:@"@chatroom"];
-    WCPLHaptic();
-
-    if (!mine && !(group && realUsr.length)) { WCPLCellAction(self, @selector(onShowMsgReplyMenuItem:)); return; }
-
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:nil message:nil preferredStyle:UIAlertControllerStyleActionSheet];
-    __weak id cell = self;
-    [sheet addAction:[UIAlertAction actionWithTitle:@"引用" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        WCPLCellAction(cell, @selector(onShowMsgReplyMenuItem:));
-    }]];
-    if (mine) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"撤回" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-            WCPLCellAction(cell, @selector(onRevokeMsg:));
-        }]];
-    } else {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"引用并@对方" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            WCPLCellAction(cell, @selector(onShowMsgReplyMenuItem:));
-            id contact = [WCPLService(@"CContactMgr") performSelector:@selector(getContactByName:) withObject:realUsr];
-            if (contact && [vc respondsToSelector:@selector(longPressOnHeadImage:)])
-                [vc performSelector:@selector(longPressOnHeadImage:) withObject:contact];
-        }]];
-    }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    sheet.popoverPresentationController.sourceView = self;
-    [vc presentViewController:sheet animated:YES completion:nil];
-}
-
-%end
-
-#pragma mark - 7b. 点击引用跳转 (WCPulse handleTapForReferMsg: 0x7378c0)
-
-// The argument is the quoted CMessageWrap; WCPulse scrolls the chat to it instead of WeChat's preview.
-// Images (3) / videos (43, 62) keep the native preview unless their own switch is on.
-// WCPulse hooks CommonMessageCellView, but on this WeChat only TextMessageCellView implements it (device log).
-static BOOL WCPLReferJump(UIView *cell, id ref) {
-    if (!WCPLBool(@"WCPLReferJump") || ![ref isKindOfClass:%c(CMessageWrap)]) return NO;
-    unsigned type = [ref m_uiMessageType];
-    if (type == 3 && !WCPLBool(@"WCPLReferJumpImage")) return NO;
-    if ((type == 43 || type == 62) && !WCPLBool(@"WCPLReferJumpVideo")) return NO;
-    SEL scroll = @selector(scrollToMessage:highlight:marginTop:animated:);
-    NSMutableArray *cands = [NSMutableArray array];
-    if ([cell respondsToSelector:@selector(getViewController)]) [cands addObject:[cell performSelector:@selector(getViewController)] ?: NSNull.null];
-    if ([cell respondsToSelector:@selector(getCurrentViewController)]) [cands addObject:[cell performSelector:@selector(getCurrentViewController)] ?: NSNull.null];
-    for (UIResponder *r = cell; r; r = r.nextResponder) if ([r isKindOfClass:UIViewController.class]) [cands addObject:r];
-    for (id vc in cands) {
-        if (![vc respondsToSelector:scroll]) continue;
-        ((void (*)(id, SEL, id, BOOL, double, BOOL))objc_msgSend)(vc, scroll, ref, YES, UIScreen.mainScreen.bounds.size.height / 3, YES);
-        return YES;
-    }
-    return NO;
-}
-
-%hook TextMessageCellView
-- (void)handleTapForReferMsg:(id)ref {
-    if (!WCPLReferJump((UIView *)self, ref)) %orig;
-}
-%end
-
-#pragma mark - 7c. 群聊艾特提示 (WCPulse viewDidAppear scan 0xadc78 / 0x11fb98, @-detect 0x69748, edge view 0xae674)
-
-// Entering a group chat: scan recent messages for ones whose m_nsAtUserList (","-joined) contains my
-// wxid or "notify@all", then float an MMEdgeTipsView "有人@你(N)". Tap -> scrollToMessage; swipe/long-press -> dismiss.
-// Per-room dismissed state is kept in WCPLDefaults so a dismissed tip doesn't re-show on re-entry.
-// ponytail: scans only the already-loaded GetMessagesWrapArray (recent page), not WeChat's full history
-// via GetDownMsg:FromID:Limit:LeftCount: like the original's paged WCPulseMentionScanner. Covers @ in
-// recent unread; add paged scan if someone needs @ far above the loaded window.
-
-@interface MMEdgeTipsView : UIView
-- (instancetype)initWithTitle:(NSString *)title image:(UIImage *)image;
-- (void)showAnimate:(BOOL)a parentView:(UIView *)p finishBlock:(id)b;
-- (void)hideAnimate:(BOOL)a parentView:(UIView *)p finishBlock:(id)b;
-@end
-@interface CMessageWrap (WCPLAt)
-@property (nonatomic, readonly) unsigned int m_uiMesLocalID;
-@property (nonatomic, copy, readonly) NSString *m_nsAtUserList;
-@end
-
-static char kWCPLAtTipsView, kWCPLAtTarget;
-static const NSInteger kWCPLAtTag = 0x91d;
-
-// myWxid: WeChat stores the logged-in user under SettingUtil (same source the swipe feature uses).
-static NSString *WCPLMyWxid(void) {
-    NSString *me = [%c(SettingUtil) performSelector:@selector(getLocalUsrName:) withObject:nil];
-    return me.length ? me : nil;
-}
-
-static BOOL WCPLMsgAtsMe(CMessageWrap *msg, NSString *me) {
-    NSString *list = [msg respondsToSelector:@selector(m_nsAtUserList)] ? msg.m_nsAtUserList : nil;
-    if (![list isKindOfClass:NSString.class] || !list.length) return NO;
-    NSArray *ats = [list componentsSeparatedByString:@","];
-    return (me && [ats containsObject:me]) || [ats containsObject:@"notify@all"];
-}
-
-// Per-room key under which we remember the last-dismissed @ localID.
-static NSString *WCPLAtRoomKey(NSString *room) { return [@"WCPLAtDismissed_" stringByAppendingString:room ?: @""]; }
-
-@interface BaseMsgContentViewController (WCPLAt)
-- (id)getChatContact;
-- (NSArray *)GetMessagesWrapArray;
-- (void)wcpl_showAtTips;
-- (void)wcpl_dismissAtTips:(id)sender;
-- (void)wcpl_tapAtTips:(id)sender;
-- (void)wcpl_positionAtTips;
-@end
-
-%hook BaseMsgContentViewController
-
-- (void)viewDidAppear:(BOOL)animated {
-    %orig;
-    if (!WCPLBool(@"WCPLGroupAtTips")) return;
-    // Let the message list settle (WeChat loads unread on appear), then scan once.
-    __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (weakSelf.viewIfLoaded.window) [weakSelf wcpl_showAtTips];
-    });
-}
-
-%new
-- (void)wcpl_showAtTips {
-    id contact = [self respondsToSelector:@selector(getChatContact)] ? [self getChatContact] : nil;
-    NSString *room = [contact respondsToSelector:@selector(m_nsUsrName)] ? [contact performSelector:@selector(m_nsUsrName)] : nil;
-    if (![room hasSuffix:@"@chatroom"]) return;                       // group chats only
-    if (![self respondsToSelector:@selector(GetMessagesWrapArray)]) return;
-
-    NSString *me = WCPLMyWxid();
-    NSArray *msgs = [self GetMessagesWrapArray];
-    BOOL filterVisible = WCPLBool(@"WCPLGroupAtTipsFilterVisible");
-    // ponytail: "visible" = last 10 loaded rows, same heuristic the original uses for the on-screen set.
-    NSUInteger visibleFrom = msgs.count > 10 ? msgs.count - 10 : 0;
-
-    NSMutableArray<CMessageWrap *> *matches = [NSMutableArray array];
-    NSNumber *dismissed = [WCPLDefaults() objectForKey:WCPLAtRoomKey(room)];
-    for (NSUInteger i = 0; i < msgs.count; i++) {
-        CMessageWrap *m = msgs[i];
-        if (![m isKindOfClass:%c(CMessageWrap)] || !WCPLMsgAtsMe(m, me)) continue;
-        if (filterVisible && i >= visibleFrom) continue;             // already on screen
-        if (dismissed && m.m_uiMesLocalID <= dismissed.unsignedIntValue) continue; // user dismissed up to here
-        [matches addObject:m];
-    }
-    if (!matches.count) { [self wcpl_dismissAtTips:nil]; return; }
-
-    // Jump target: newest match (sort on) or oldest (sort off).
-    CMessageWrap *target = WCPLBool(@"WCPLGroupAtTipsSort") ? matches.lastObject : matches.firstObject;
-    objc_setAssociatedObject(self, &kWCPLAtTarget, target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    MMEdgeTipsView *tips = objc_getAssociatedObject(self, &kWCPLAtTipsView);
-    if (tips) [tips hideAnimate:NO parentView:self.view finishBlock:nil];
-    NSString *title = [NSString stringWithFormat:@"有人@你(%lu)", (unsigned long)matches.count];
-    UIImage *arrow = [UIImage systemImageNamed:@"chevron.up"] ?: nil;
-    tips = [[%c(MMEdgeTipsView) alloc] initWithTitle:title image:arrow];
-    tips.tag = kWCPLAtTag;
-    [tips addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(wcpl_tapAtTips:)]];
-    UISwipeGestureRecognizer *sw = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(wcpl_dismissAtTips:)];
-    sw.direction = UISwipeGestureRecognizerDirectionLeft;
-    [tips addGestureRecognizer:sw];
-    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(wcpl_dismissAtTips:)];
-    lp.minimumPressDuration = 0.5;
-    [tips addGestureRecognizer:lp];
-    objc_setAssociatedObject(self, &kWCPLAtTipsView, tips, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    [self wcpl_positionAtTips];
-    [tips showAnimate:YES parentView:self.view finishBlock:nil];
-}
-
-%new
-- (void)wcpl_tapAtTips:(id)sender {
-    CMessageWrap *target = objc_getAssociatedObject(self, &kWCPLAtTarget);
-    if (target && [self respondsToSelector:@selector(scrollToMessage:highlight:marginTop:animated:)])
-        ((void (*)(id, SEL, id, BOOL, double, BOOL))objc_msgSend)(self,
-            @selector(scrollToMessage:highlight:marginTop:animated:), target, YES,
-            UIScreen.mainScreen.bounds.size.height / 3, YES);
-    [self wcpl_dismissAtTips:sender];
-}
-
-%new
-- (void)wcpl_dismissAtTips:(id)sender {
-    MMEdgeTipsView *tips = objc_getAssociatedObject(self, &kWCPLAtTipsView);
-    if (!tips) return;
-    // Remember how far the user has dismissed so re-entry doesn't re-show the same @.
-    CMessageWrap *target = objc_getAssociatedObject(self, &kWCPLAtTarget);
-    id contact = [self respondsToSelector:@selector(getChatContact)] ? [self getChatContact] : nil;
-    NSString *room = [contact respondsToSelector:@selector(m_nsUsrName)] ? [contact performSelector:@selector(m_nsUsrName)] : nil;
-    if (sender && target && room.length)   // nil sender = programmatic clear, don't persist
-        [WCPLDefaults() setObject:@(target.m_uiMesLocalID) forKey:WCPLAtRoomKey(room)];
-    [tips hideAnimate:(sender != nil) parentView:self.view finishBlock:nil];
-    objc_setAssociatedObject(self, &kWCPLAtTipsView, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(self, &kWCPLAtTarget, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-%new
-- (void)wcpl_positionAtTips {
-    MMEdgeTipsView *tips = objc_getAssociatedObject(self, &kWCPLAtTipsView);
-    if (!tips || tips.superview != self.view) {
-        if (tips && !tips.superview) [self.view addSubview:tips];
-        else if (!tips) return;
-    }
-    [tips sizeToFit];
-    CGSize sz = tips.bounds.size;
-    if (sz.width < 1) sz = CGSizeMake(130, 36);
-    CGFloat right = self.view.bounds.size.width - sz.width - 12;
-    // Sit just above the input toolbar; fall back to a safe-area offset.
-    CGFloat bottom = self.view.bounds.size.height - self.view.safeAreaInsets.bottom - 56 - sz.height;
-    tips.frame = CGRectMake(right, bottom, sz.width, sz.height);
-}
-
-%end
-
-// Keyboard / toolbar height changes -> keep the pill above the input bar.
-%hook MMInputToolView
-- (void)updateToolViewHeight:(CGFloat)h {
-    %orig;
-    if (!WCPLBool(@"WCPLGroupAtTips")) return;
-    UIViewController *vc = WCPLOwnerVC((UIView *)self);
-    if ([vc respondsToSelector:@selector(wcpl_positionAtTips)]) [vc performSelector:@selector(wcpl_positionAtTips)];
 }
 %end
 
@@ -735,13 +306,11 @@ static char kGesture, kDelegate, kBaseRate, kStartPoint, kLastStep;
 }
 @end
 
-static void WCPLHaptic(void) {
-    [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred];
-}
-
+// "2.0x" -> 2.0. Bad input (0 would pause the video) falls back to 2.0x; otherwise clamped to the gesture range.
 static float WCPLSideRate(BOOL left) {
     NSString *s = [WCPLDefaults() stringForKey:left ? @"WCPLLeftSpeed" : @"WCPLRightSpeed"];
-    return [[s stringByReplacingOccurrencesOfString:@"x" withString:@""] floatValue];
+    float r = [[s stringByReplacingOccurrencesOfString:@"x" withString:@""] floatValue];
+    return r > 0 ? WCPLRate(r, 0) : 2.0f;
 }
 
 // 0x116000: restore 1.0x, hide HUD, clear gesture state.
@@ -759,7 +328,7 @@ static void WCPLResetSpeed(WCPlayerView *player) {
 static void WCPLPrioritize(UIView *view, UIGestureRecognizer *ours) {
     if (!view || !ours) return;
     for (UIView *v = view; v; v = v.superview)
-        for (UIGestureRecognizer *g in [v.gestureRecognizers copy])
+        for (UIGestureRecognizer *g in v.gestureRecognizers)
             if (g != ours && ![g isKindOfClass:UITapGestureRecognizer.class] &&
                 ![g isKindOfClass:UIPinchGestureRecognizer.class] && ![g isKindOfClass:UIRotationGestureRecognizer.class])
                 [g requireGestureRecognizerToFail:ours];
@@ -799,14 +368,13 @@ static void WCPLPrioritize(UIView *view, UIGestureRecognizer *ours) {
         objc_setAssociatedObject(self, &kDelegate, del, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, &kGesture, g, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [self addGestureRecognizer:g];
+        WCPLPrioritize(self, g);   // re-applied on every touch in shouldReceiveTouch:, once ancestors exist
     } else if (!on && g) {
         WCPLResetSpeed(self);
         [self removeGestureRecognizer:g];
         objc_setAssociatedObject(self, &kGesture, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, &kDelegate, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        g = nil;
     }
-    if (on && g) WCPLPrioritize(self, g);
 }
 
 %new
@@ -858,16 +426,354 @@ static void WCPLPrioritize(UIView *view, UIGestureRecognizer *ours) {
 // WeChat's own full-screen long press (menu) must not fire inside the 15% edge zones.
 %hook WXFullScreenGestureRecognizer
 - (void)LongPressEvents {
-    if (!WCPLBool(@"WCPLVideoSpeed")) {
-        %orig;
-        return;
-    }
     UIView *v = ((UIGestureRecognizer *)self).view;
-    if (v && WCPLIsEdge([self touchBeginPoint].x, v.bounds.size.width)) return;
+    if (WCPLBool(@"WCPLVideoSpeed") && v && [self respondsToSelector:@selector(touchBeginPoint)] &&
+        WCPLIsEdge([self touchBeginPoint].x, v.bounds.size.width)) return;
     %orig;
 }
 %end
 
+#pragma mark - 4. 消息直达 (WCPush2Chat 0x4bbc / 0x4e28 / 0x5530 / 0x5974)
+
+// Tapping a message notification opens that chat directly (full-screen push or half-screen sheet).
+
+static UIViewController *WCPLTopVC(void) {
+    UIViewController *vc = UIApplication.sharedApplication.keyWindow.rootViewController;
+    for (;;) {
+        if (vc.presentedViewController) vc = vc.presentedViewController;
+        else if ([vc isKindOfClass:UITabBarController.class]) vc = ((UITabBarController *)vc).selectedViewController;
+        else if ([vc isKindOfClass:UINavigationController.class]) vc = ((UINavigationController *)vc).visibleViewController;
+        else return vc;
+    }
+}
+
+static id WCPLContact(NSString *user) {
+    id mgr = WCPLService(@"CContactMgr");
+    return user.length && [mgr respondsToSelector:@selector(getContactByName:)] ? [mgr performSelector:@selector(getContactByName:) withObject:user] : nil;
+}
+
+static void WCPLOpenChat(CContact *contact, UIViewController *vc, BOOL foreground) {
+    BOOL half = [WCPLDefaults() integerForKey:foreground ? @"WCPLPushFGMode" : @"WCPLPushBGMode"] == 1;
+    SEL sheet = @selector(showPageSheetSession:fromViewController:);
+    SEL push = @selector(PushOtherBaseMsgControllerByContact:navigationController:animated:);
+    id quick = WCPLService(@"QuickReplyMsgMgr"), logic = WCPLService(@"MMMsgLogicManager");
+    if (half && [quick respondsToSelector:sheet])
+        [quick performSelector:@selector(showPageSheetSession:fromViewController:) withObject:contact withObject:vc];
+    else if ([logic respondsToSelector:push])
+        ((void (*)(id, SEL, id, id, BOOL))objc_msgSend)(logic, push, contact, vc.navigationController, YES);
+}
+
+// UI may not be ready right after a cold launch: retry every 0.5s, give up after 10 tries (as the original).
+static void WCPLPushToChat(UNNotificationResponse *response, BOOL foreground) {
+    NSString *user = response.notification.request.content.userInfo[@"u"];
+    if (![user isKindOfClass:NSString.class]) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CContact *contact = WCPLContact(user);
+        if (!contact) return;
+        __block int tries = 0;
+        [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+            UIViewController *top = WCPLTopVC();
+            if (!top.navigationController) { if (++tries >= 10) [t invalidate]; return; }
+            [t invalidate];
+            if (foreground && [WCPLChatUser(top) isEqualToString:user]) return;   // already in that chat
+            WCPLOpenChat(contact, top, foreground);
+        }];
+    });
+}
+
+%hook MicroMessengerAppDelegate
+- (void)userNotificationCenter:(id)c didReceiveNotificationResponse:(UNNotificationResponse *)r withCompletionHandler:(id)h {
+    if (WCPLBool(@"WCPLPushBG")) WCPLPushToChat(r, NO);
+    %orig;
+}
+%end
+
+%hook NotificationActionsMgr
+- (void)userNotificationCenter:(id)c didReceiveNotificationResponse:(UNNotificationResponse *)r withCompletionHandler:(id)h {
+    if (WCPLBool(@"WCPLPushFG")) WCPLPushToChat(r, YES);
+    %orig;
+}
+%end
+
+#pragma mark - 5. 防撤回 (WCPulse -[MessageRevokeMgr onRevokeMsg:] 0x10588c)
+
+// Instead of letting WeChat delete the message, keep it and insert a local system note after it.
+static NSString *WCPLXMLValue(NSString *xml, NSString *tag) {
+    if (![xml isKindOfClass:NSString.class] || !xml.length) return nil;
+    NSRange a = [xml rangeOfString:[NSString stringWithFormat:@"<%@>", tag]];
+    NSRange b = [xml rangeOfString:[NSString stringWithFormat:@"</%@>", tag]];
+    if (a.location == NSNotFound || b.location == NSNotFound || b.location < NSMaxRange(a)) return nil;
+    NSString *v = [xml substringWithRange:NSMakeRange(NSMaxRange(a), b.location - NSMaxRange(a))];
+    if ([v hasPrefix:@"<![CDATA["] && [v hasSuffix:@"]]>"]) v = [v substringWithRange:NSMakeRange(9, v.length - 12)];
+    return v;
+}
+
+static NSString *WCPLFormatTime(unsigned int t) {
+    static NSDateFormatter *f;
+    if (!f) f = [NSDateFormatter new];
+    NSString *fmt = [WCPLDefaults() stringForKey:@"WCPLTimeFormat"];
+    if (![f.dateFormat isEqualToString:fmt]) f.dateFormat = fmt;
+    return [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:t]];
+}
+
+%hook MessageRevokeMgr
+- (void)onRevokeMsg:(CMessageWrap *)wrap {
+    SEL get = @selector(GetMsg:n64SvrID:), add = @selector(AddLocalMsg:MsgWrap:fixTime:NewMsgArriveNotify:);
+    id msgMgr = WCPLBool(@"WCPLNoRevoke") ? WCPLService(@"CMessageMgr") : nil;
+    Class wrapCls = %c(CMessageWrap);
+    if (![msgMgr respondsToSelector:get] || ![msgMgr respondsToSelector:add] || !wrapCls) {
+        %orig;
+        return;
+    }
+    NSString *xml = wrap.m_nsContent, *session = WCPLXMLValue(xml, @"session") ?: wrap.m_nsFromUsr;
+    NSString *svrID = WCPLXMLValue(xml, @"newmsgid"), *replace = WCPLXMLValue(xml, @"replacemsg") ?: @"";
+    CMessageWrap *orig = svrID.length && session ? ((id (*)(id, SEL, id, long long))objc_msgSend)(msgMgr, get, session, svrID.longLongValue) : nil;
+    // My own revokes ("你撤回了一条消息") and unknown messages go through normally.
+    if (!orig || [replace hasPrefix:@"你"]) {
+        %orig;
+        return;
+    }
+
+    NSString *name = [[replace componentsSeparatedByString:@"撤回了"].firstObject
+        stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"\"“” "]];
+    CMessageWrap *note = [[wrapCls alloc] initWithMsgType:10000];   // system tip
+    note.m_nsFromUsr = orig.m_nsFromUsr;
+    note.m_nsToUsr = orig.m_nsToUsr;
+    note.m_uiStatus = 4;
+    note.m_uiCreateTime = orig.m_uiCreateTime + 1;
+    note.m_nsContent = [NSString stringWithFormat:@"%@ 已拦截%@撤回的消息", WCPLFormatTime(orig.m_uiCreateTime), name.length ? name : @"对方"];
+    ((void (*)(id, SEL, id, id, BOOL, BOOL))objc_msgSend)(msgMgr, add, session, note, YES, NO);
+}
+%end
+
+#pragma mark - 6. 左滑消息 (WCPulse wcpulse_handleSwipeGesture: 0xe672c / onReplyMsg: 0xe8ce4)
+
+// Swipe left on a bubble: others' message -> 引用 / 引用并@ (group only); my message -> 撤回 / 引用.
+// Uses WeChat's own cell actions, same as the original: onShowMsgReplyMenuItem:, onRevokeMsg:, longPressOnHeadImage:.
+@interface CommonMessageCellView : UIView
+- (id)viewModel;
+@end
+
+static char kWCPLSwipe;
+
+static void WCPLCellAction(id cell, SEL sel) {
+    if ([cell respondsToSelector:sel]) ((void (*)(id, SEL, id))objc_msgSend)(cell, sel, nil);
+}
+
+%hook CommonMessageCellView
+- (void)layoutInternal {
+    %orig;
+    if (!WCPLBool(@"WCPLSwipeMsg") || objc_getAssociatedObject(self, &kWCPLSwipe)) return;
+    UISwipeGestureRecognizer *g = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(wcpl_swiped:)];
+    g.direction = UISwipeGestureRecognizerDirectionLeft;
+    [self addGestureRecognizer:g];
+    objc_setAssociatedObject(self, &kWCPLSwipe, g, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+%new
+- (void)wcpl_swiped:(UISwipeGestureRecognizer *)g {
+    if (!WCPLBool(@"WCPLSwipeMsg")) return;
+    id model = [self respondsToSelector:@selector(viewModel)] ? [self viewModel] : nil;
+    CMessageWrap *msg = [model respondsToSelector:@selector(messageWrap)] ? [model performSelector:@selector(messageWrap)] : nil;
+    UIViewController *vc = WCPLOwnerVC(self);
+    if (![msg isKindOfClass:%c(CMessageWrap)] || !vc) return;
+    NSString *me = WCPLMyWxid();
+    BOOL mine = me && [msg.m_nsFromUsr isEqualToString:me];
+    NSString *realUsr = [msg respondsToSelector:@selector(m_nsRealChatUsr)] ? msg.m_nsRealChatUsr : nil;
+    BOOL group = [msg.m_nsFromUsr hasSuffix:@"@chatroom"] || [msg.m_nsToUsr hasSuffix:@"@chatroom"];
+    WCPLHaptic();
+
+    if (!mine && !(group && realUsr.length)) { WCPLCellAction(self, @selector(onShowMsgReplyMenuItem:)); return; }
+
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:nil message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak id cell = self;
+    [sheet addAction:[UIAlertAction actionWithTitle:@"引用" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        WCPLCellAction(cell, @selector(onShowMsgReplyMenuItem:));
+    }]];
+    if (mine) {
+        [sheet addAction:[UIAlertAction actionWithTitle:@"撤回" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+            WCPLCellAction(cell, @selector(onRevokeMsg:));
+        }]];
+    } else {
+        [sheet addAction:[UIAlertAction actionWithTitle:@"引用并@对方" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            WCPLCellAction(cell, @selector(onShowMsgReplyMenuItem:));
+            id contact = WCPLContact(realUsr);
+            if (contact && [vc respondsToSelector:@selector(longPressOnHeadImage:)])
+                [vc performSelector:@selector(longPressOnHeadImage:) withObject:contact];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    sheet.popoverPresentationController.sourceView = self;
+    [vc presentViewController:sheet animated:YES completion:nil];
+}
+
+%end
+
+#pragma mark - 7. 点击引用跳转 (WCPulse handleTapForReferMsg: 0x7378c0)
+
+// The argument is the quoted CMessageWrap; WCPulse scrolls the chat to it instead of WeChat's preview.
+// Images (3) / videos (43, 62) keep the native preview unless their own switch is on.
+// WCPulse hooks CommonMessageCellView, but on this WeChat only TextMessageCellView implements it (device log).
+static BOOL WCPLReferJump(UIView *cell, id ref) {
+    if (!WCPLBool(@"WCPLReferJump") || ![ref isKindOfClass:%c(CMessageWrap)]) return NO;
+    unsigned type = [ref m_uiMessageType];
+    if (type == 3 && !WCPLBool(@"WCPLReferJumpImage")) return NO;
+    if ((type == 43 || type == 62) && !WCPLBool(@"WCPLReferJumpVideo")) return NO;
+    // The cell's own VC getters first, then any VC up the responder chain.
+    for (NSString *getter in @[@"getViewController", @"getCurrentViewController"]) {
+        SEL sel = NSSelectorFromString(getter);
+        if ([cell respondsToSelector:sel] && WCPLScrollToMsg(((id (*)(id, SEL))objc_msgSend)(cell, sel), ref)) return YES;
+    }
+    for (UIResponder *r = cell; r; r = r.nextResponder)
+        if ([r isKindOfClass:UIViewController.class] && WCPLScrollToMsg(r, ref)) return YES;
+    return NO;
+}
+
+%hook TextMessageCellView
+- (void)handleTapForReferMsg:(id)ref {
+    if (!WCPLReferJump((UIView *)self, ref)) %orig;
+}
+%end
+
+#pragma mark - 8. 群聊艾特提示 (WCPulse viewDidAppear scan 0xadc78 / 0x11fb98, @-detect 0x69748, edge view 0xae674)
+
+// Entering a group chat: scan recent messages for ones whose m_nsAtUserList (","-joined) contains my
+// wxid or "notify@all", then float an MMEdgeTipsView "有人@你(N)". Tap -> scrollToMessage; swipe/long-press -> dismiss.
+// Per-room dismissed state is kept in WCPLDefaults so a dismissed tip doesn't re-show on re-entry.
+// ponytail: scans only the already-loaded GetMessagesWrapArray (recent page), not WeChat's full history
+// via GetDownMsg:FromID:Limit:LeftCount: like the original's paged WCPulseMentionScanner. Covers @ in
+// recent unread; add paged scan if someone needs @ far above the loaded window.
+
+@interface MMEdgeTipsView : UIView
+- (instancetype)initWithTitle:(NSString *)title image:(UIImage *)image;
+- (void)showAnimate:(BOOL)a parentView:(UIView *)p finishBlock:(id)b;
+- (void)hideAnimate:(BOOL)a parentView:(UIView *)p finishBlock:(id)b;
+@end
+
+static char kWCPLAtTipsView, kWCPLAtTarget;
+
+static BOOL WCPLMsgAtsMe(CMessageWrap *msg, NSString *me) {
+    NSString *list = [msg respondsToSelector:@selector(m_nsAtUserList)] ? msg.m_nsAtUserList : nil;
+    if (![list isKindOfClass:NSString.class] || !list.length) return NO;
+    NSArray *ats = [list componentsSeparatedByString:@","];
+    return (me && [ats containsObject:me]) || [ats containsObject:@"notify@all"];
+}
+
+// Per-room key under which we remember the last-dismissed @ localID.
+static NSString *WCPLAtRoomKey(NSString *room) { return [@"WCPLAtDismissed_" stringByAppendingString:room]; }
+
+@interface BaseMsgContentViewController (WCPLAt)
+- (void)wcpl_showAtTips;
+- (void)wcpl_dismissAtTips:(id)sender;
+- (void)wcpl_tapAtTips:(id)sender;
+- (void)wcpl_positionAtTips;
+@end
+
+%hook BaseMsgContentViewController
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    if (!WCPLBool(@"WCPLGroupAtTips")) return;
+    // Let the message list settle (WeChat loads unread on appear), then scan once.
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (weakSelf.viewIfLoaded.window) [weakSelf wcpl_showAtTips];
+    });
+}
+
+%new
+- (void)wcpl_showAtTips {
+    NSString *room = WCPLChatUser(self);
+    Class tipsCls = %c(MMEdgeTipsView);
+    if (![room hasSuffix:@"@chatroom"]) return;                       // group chats only
+    if (![self respondsToSelector:@selector(GetMessagesWrapArray)] ||
+        ![tipsCls instancesRespondToSelector:@selector(showAnimate:parentView:finishBlock:)]) return;
+    NSArray *msgs = [self GetMessagesWrapArray];
+    if (![msgs isKindOfClass:NSArray.class]) return;
+
+    NSString *me = WCPLMyWxid();
+    Class wrapCls = %c(CMessageWrap);
+    BOOL filterVisible = WCPLBool(@"WCPLGroupAtTipsFilterVisible");
+    // ponytail: "visible" = last 10 loaded rows, same heuristic the original uses for the on-screen set.
+    NSUInteger visibleFrom = msgs.count > 10 ? msgs.count - 10 : 0;
+    NSNumber *dismissed = [WCPLDefaults() objectForKey:WCPLAtRoomKey(room)];
+    if (![dismissed isKindOfClass:NSNumber.class]) dismissed = nil;
+
+    NSMutableArray<CMessageWrap *> *matches = [NSMutableArray array];
+    [msgs enumerateObjectsUsingBlock:^(CMessageWrap *m, NSUInteger i, BOOL *stop) {
+        if (filterVisible && i >= visibleFrom) { *stop = YES; return; }    // rest is already on screen
+        if (![m isKindOfClass:wrapCls] || !WCPLMsgAtsMe(m, me)) return;
+        if (dismissed && m.m_uiMesLocalID <= dismissed.unsignedIntValue) return; // user dismissed up to here
+        [matches addObject:m];
+    }];
+    if (!matches.count) { [self wcpl_dismissAtTips:nil]; return; }
+
+    // Jump target: newest match (sort on) or oldest (sort off).
+    CMessageWrap *target = WCPLBool(@"WCPLGroupAtTipsSort") ? matches.lastObject : matches.firstObject;
+    objc_setAssociatedObject(self, &kWCPLAtTarget, target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    MMEdgeTipsView *tips = objc_getAssociatedObject(self, &kWCPLAtTipsView);
+    if (tips) [tips hideAnimate:NO parentView:self.view finishBlock:nil];
+    NSString *title = [NSString stringWithFormat:@"有人@你(%lu)", (unsigned long)matches.count];
+    tips = [[tipsCls alloc] initWithTitle:title image:[UIImage systemImageNamed:@"chevron.up"]];
+    if (!tips) return;
+    [tips addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(wcpl_tapAtTips:)]];
+    UISwipeGestureRecognizer *sw = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(wcpl_dismissAtTips:)];
+    sw.direction = UISwipeGestureRecognizerDirectionLeft;
+    [tips addGestureRecognizer:sw];
+    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(wcpl_dismissAtTips:)];
+    lp.minimumPressDuration = 0.5;
+    [tips addGestureRecognizer:lp];
+    objc_setAssociatedObject(self, &kWCPLAtTipsView, tips, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [self wcpl_positionAtTips];
+    [tips showAnimate:YES parentView:self.view finishBlock:nil];
+}
+
+%new
+- (void)wcpl_tapAtTips:(id)sender {
+    WCPLScrollToMsg(self, objc_getAssociatedObject(self, &kWCPLAtTarget));
+    [self wcpl_dismissAtTips:sender];
+}
+
+%new
+- (void)wcpl_dismissAtTips:(id)sender {
+    MMEdgeTipsView *tips = objc_getAssociatedObject(self, &kWCPLAtTipsView);
+    if (!tips) return;
+    // Remember how far the user has dismissed so re-entry doesn't re-show the same @.
+    CMessageWrap *target = objc_getAssociatedObject(self, &kWCPLAtTarget);
+    NSString *room = WCPLChatUser(self);
+    if (sender && target && room.length)   // nil sender = programmatic clear, don't persist
+        [WCPLDefaults() setObject:@(target.m_uiMesLocalID) forKey:WCPLAtRoomKey(room)];
+    [tips hideAnimate:(sender != nil) parentView:self.view finishBlock:nil];
+    objc_setAssociatedObject(self, &kWCPLAtTipsView, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(self, &kWCPLAtTarget, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+%new
+- (void)wcpl_positionAtTips {
+    MMEdgeTipsView *tips = objc_getAssociatedObject(self, &kWCPLAtTipsView);
+    if (!tips) return;
+    if (!tips.superview) [self.view addSubview:tips];
+    [tips sizeToFit];
+    CGSize sz = tips.bounds.size;
+    if (sz.width < 1) sz = CGSizeMake(130, 36);
+    CGFloat right = self.view.bounds.size.width - sz.width - 12;
+    // Sit just above the input toolbar.
+    CGFloat bottom = self.view.bounds.size.height - self.view.safeAreaInsets.bottom - 56 - sz.height;
+    tips.frame = CGRectMake(right, bottom, sz.width, sz.height);
+}
+
+%end
+
+// Keyboard / toolbar height changes -> keep the pill above the input bar.
+%hook MMInputToolView
+- (void)updateToolViewHeight:(CGFloat)h {
+    %orig;
+    if (!WCPLBool(@"WCPLGroupAtTips")) return;
+    UIViewController *vc = WCPLOwnerVC((UIView *)self);
+    if ([vc respondsToSelector:@selector(wcpl_positionAtTips)]) [vc performSelector:@selector(wcpl_positionAtTips)];
+}
+%end
 
 #pragma mark - 9. 空输入框长按语音 (WCPulse MMTextView 0xa8f48..0xaae90, MMInputToolView 0xd9a3c..0xda640)
 
@@ -887,7 +793,7 @@ static void WCPLPrioritize(UIView *view, UIGestureRecognizer *ours) {
 @end
 
 static char kVoicePending, kVoiceActive, kVoiceDisabledGR;
-static BOOL gVoiceBlockMode2;   // WCPulse 0xa25e48: for 2s after recording, keep WeChat out of input mode 2
+static CFTimeInterval gVoiceBlockMode2Until;   // WCPulse 0xa25e48: for 2s after recording, keep WeChat out of input mode 2
 
 // 0x11f130: empty after removing zero-width chars and whitespace.
 static BOOL WCPLTextEmpty(NSString *s) {
@@ -975,10 +881,7 @@ static void WCPLVoiceRestoreGestures(MMTextView *tv) {
     objc_setAssociatedObject(self, &kVoiceActive, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     WCPLVoiceRestoreGestures(self);
     [WCPLToolView(self) MMTransparentButton_touchesEnded:touches withEvent:event];
-    gVoiceBlockMode2 = YES;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        gVoiceBlockMode2 = NO;
-    });
+    gVoiceBlockMode2Until = CACurrentMediaTime() + 2;
 }
 
 - (void)touchesCancelled:(NSSet *)touches withEvent:(UIEvent *)event {
@@ -996,11 +899,136 @@ static void WCPLVoiceRestoreGestures(MMTextView *tv) {
 %hook MMInputToolView
 // 0xda640: right after a voice send WeChat switches to mode 2; WCPulse keeps mode 1 instead.
 - (void)setInputMode:(long long)mode animated:(BOOL)animated {
-    if (gVoiceBlockMode2 && mode == 2) {
-        %orig(1, animated);
-        return;
-    }
-    %orig;
+    if (mode == 2 && CACurrentMediaTime() < gVoiceBlockMode2Until) mode = 1;
+    %orig(mode, animated);
 }
 %end
 
+#pragma mark - 10. 设置页 (entry mirrors WCPush2Chat 0x527c / 0x5498)
+
+// Row kinds: S = switch, T = text (alert input), M = 全屏/半屏 segment.
+static NSArray<NSArray *> *WCPLRows(void) {
+    static NSArray *rows;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ rows = @[
+        @[@"置顶", @[@"S", @"启用置顶点击保留", @"WCPLTopClickKeep"]],
+        @[@"首页圆角（重启微信生效）", @[@"S", @"启用首页圆角", @"WCPLHomeCorner"],
+                                     @[@"T", @"↳ 上下间距", @"WCPLHomeCornerVPadding"],
+                                     @[@"T", @"↳ 背景颜色", @"WCPLHomeCornerLight"],
+                                     @[@"T", @"↳ 深色背景颜色", @"WCPLHomeCornerDark"]],
+        @[@"视频", @[@"S", @"启用视频倍速手势", @"WCPLVideoSpeed"],
+                  @[@"T", @"↳ 左侧倍速", @"WCPLLeftSpeed"],
+                  @[@"T", @"↳ 右侧倍速", @"WCPLRightSpeed"]],
+        @[@"消息", @[@"S", @"启用防撤回", @"WCPLNoRevoke"],
+                  @[@"S", @"左滑消息引用/撤回", @"WCPLSwipeMsg"],
+                  @[@"T", @"↳ 撤回提示时间格式", @"WCPLTimeFormat"]],
+        @[@"引用", @[@"S", @"点击引用跳转到原消息", @"WCPLReferJump"],
+                  @[@"S", @"↳ 引用图片也跳转", @"WCPLReferJumpImage"],
+                  @[@"S", @"↳ 引用视频也跳转", @"WCPLReferJumpVideo"]],
+        @[@"群聊艾特", @[@"S", @"启用群聊艾特提示", @"WCPLGroupAtTips"],
+                     @[@"S", @"↳ 跳到最新一条@（关=最早）", @"WCPLGroupAtTipsSort"],
+                     @[@"S", @"↳ 已看到的@不再提示", @"WCPLGroupAtTipsFilterVisible"]],
+        @[@"输入框", @[@"S", @"空输入框长按语音", @"WCPLEmptyInputVoice"]],
+        @[@"消息直达", @[@"S", @"开启前台直达", @"WCPLPushFG"],
+                    @[@"M", @"↳ 前台直达模式", @"WCPLPushFGMode"],
+                    @[@"S", @"开启后台直达", @"WCPLPushBG"],
+                    @[@"M", @"↳ 后台直达模式", @"WCPLPushBGMode"]],
+    ]; });
+    return rows;
+}
+
+@interface WCPLSettingsVC : UITableViewController
+@end
+
+@implementation WCPLSettingsVC
+- (instancetype)init {
+    if ((self = [super initWithStyle:UITableViewStyleInsetGrouped])) self.title = @"WCPulseLite";
+    return self;
+}
+- (NSArray *)row:(NSIndexPath *)ip { return WCPLRows()[ip.section][ip.row + 1]; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return WCPLRows().count; }
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return WCPLRows()[s].count - 1; }
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return WCPLRows()[s][0]; }
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    NSArray *r = [self row:ip];
+    NSString *kind = r[0], *key = r[2];
+    UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+    c.textLabel.text = r[1];
+    c.selectionStyle = UITableViewCellSelectionStyleNone;
+    if ([kind isEqualToString:@"S"]) {
+        UISwitch *sw = [UISwitch new];
+        sw.on = [WCPLDefaults() boolForKey:key];
+        sw.accessibilityIdentifier = key;
+        [sw addTarget:self action:@selector(toggled:) forControlEvents:UIControlEventValueChanged];
+        c.accessoryView = sw;
+    } else if ([kind isEqualToString:@"M"]) {
+        UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"全屏", @"半屏"]];
+        seg.selectedSegmentIndex = [WCPLDefaults() integerForKey:key];
+        seg.accessibilityIdentifier = key;
+        [seg addTarget:self action:@selector(segmented:) forControlEvents:UIControlEventValueChanged];
+        c.accessoryView = seg;
+    } else {
+        c.detailTextLabel.text = [[WCPLDefaults() objectForKey:key] description] ?: @"";
+        c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        c.selectionStyle = UITableViewCellSelectionStyleDefault;
+    }
+    return c;
+}
+
+- (void)toggled:(UISwitch *)sw { [WCPLDefaults() setBool:sw.on forKey:sw.accessibilityIdentifier]; }
+- (void)segmented:(UISegmentedControl *)s { [WCPLDefaults() setInteger:s.selectedSegmentIndex forKey:s.accessibilityIdentifier]; }
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+    NSArray *r = [self row:ip];
+    if (![r[0] isEqualToString:@"T"]) return;
+    NSString *key = r[2];
+    BOOL number = [key isEqualToString:@"WCPLHomeCornerVPadding"];
+    BOOL color = [key hasPrefix:@"WCPLHomeCorner"];
+    double lo = 0, hi = 50;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:r[1]
+        message:number ? [NSString stringWithFormat:@"%.1f - %.1f", lo, hi] : (color ? @"十六进制颜色，如 #F7F7F7" :
+                 [key isEqualToString:@"WCPLTimeFormat"] ? @"如 MM/dd HH:mm:ss" : @"如 2.0x")
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *f) {
+        f.text = [[WCPLDefaults() objectForKey:key] description];
+        if (number) f.keyboardType = UIKeyboardTypeDecimalPad;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+        NSString *v = [a.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if (number) [WCPLDefaults() setDouble:MIN(MAX(v.doubleValue, lo), hi) forKey:key];
+        else if (v.length) [WCPLDefaults() setObject:v forKey:key];
+        [tv reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+@end
+
+@interface NewSettingViewController : UIViewController
+@end
+
+%hook NewSettingViewController
+- (void)reloadTableData {
+    %orig;
+    // Insert our entry as the first section of WeChat's own settings table. Skip silently if WeChat changed.
+    Ivar iv = class_getInstanceVariable(object_getClass(self), "m_tableViewMgr");
+    id mgr = iv ? object_getIvar(self, iv) : nil;
+    Class secCls = %c(WCTableViewSectionManager), cellCls = %c(WCTableViewNormalCellManager);
+    SEL mkCell = @selector(normalCellForSel:target:title:rightValue:canRightValueCopy:), insert = @selector(insertSection:At:);
+    if (![mgr respondsToSelector:insert] || ![secCls respondsToSelector:@selector(defaultSection)] || ![cellCls respondsToSelector:mkCell]) return;
+    id section = [secCls performSelector:@selector(defaultSection)];
+    id cell = ((id (*)(id, SEL, SEL, id, id, id, BOOL))objc_msgSend)(cellCls, mkCell,
+        @selector(wcpl_openSettings), self, @"WCPulseLite", @"", NO);
+    if (!cell || ![section respondsToSelector:@selector(addCell:)]) return;
+    [section performSelector:@selector(addCell:) withObject:cell];
+    ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(mgr, insert, section, 0);
+    if ([mgr respondsToSelector:@selector(getTableView)]) [[mgr performSelector:@selector(getTableView)] reloadData];
+}
+
+%new
+- (void)wcpl_openSettings {
+    [self.navigationController pushViewController:[WCPLSettingsVC new] animated:YES];
+}
+%end
